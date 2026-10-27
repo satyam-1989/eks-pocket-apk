@@ -9,12 +9,14 @@ import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Surface
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.CompositionLocalProvider
+import androidx.compose.runtime.SideEffect
 import androidx.compose.runtime.mutableStateListOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.saveable.rememberSaveableStateHolder
 import androidx.compose.runtime.snapshots.SnapshotStateList
 import dev.ekspocket.aws.EksCluster
 import dev.ekspocket.data.CredentialStore
+import dev.ekspocket.k8s.Kind
 import dev.ekspocket.data.Session
 import dev.ekspocket.ui.ClusterHomeScreen
 import dev.ekspocket.ui.ClustersScreen
@@ -22,9 +24,12 @@ import dev.ekspocket.ui.EditProfileScreen
 import dev.ekspocket.ui.EksPocketTheme
 import dev.ekspocket.ui.ExecScreen
 import dev.ekspocket.ui.LocalProfileName
+import dev.ekspocket.ui.KindListScreen
 import dev.ekspocket.ui.LogsScreen
+import dev.ekspocket.ui.OtherKindsScreen
 import dev.ekspocket.ui.PodDetailScreen
 import dev.ekspocket.ui.ProfilesScreen
+import dev.ekspocket.ui.SecretScreen
 import dev.ekspocket.ui.YamlScreen
 
 class MainActivity : ComponentActivity() {
@@ -51,6 +56,9 @@ sealed interface Screen {
     data class Exec(val ns: String, val pod: String, val container: String?) : Screen
     /** [path] null means "apply new YAML"; otherwise edit the object at that API path. */
     data class Yaml(val title: String, val path: String?, val namespace: String) : Screen
+    data class OtherKinds(val namespace: String?) : Screen
+    data class KindList(val kind: Kind, val namespace: String?) : Screen
+    data class SecretView(val ns: String, val name: String) : Screen
 }
 
 class Nav(private val stack: SnapshotStateList<Screen>) {
@@ -68,6 +76,8 @@ class Nav(private val stack: SnapshotStateList<Screen>) {
     }
 }
 
+private fun stateKey(index: Int, screen: Screen) = "$index:${screen.hashCode()}"
+
 @Composable
 fun App(store: CredentialStore) {
     val session = remember { Session(store) }
@@ -81,9 +91,18 @@ fun App(store: CredentialStore) {
 
     BackHandler(enabled = stack.size > 1) { nav.pop() }
 
+    // Forget saved UI state (filters, selected kind, ...) of screens that left the back stack.
+    val liveKeys = stack.mapIndexed { i, s -> stateKey(i, s) }.toSet()
+    val knownKeys = remember { mutableSetOf<String>() }
+    SideEffect {
+        (knownKeys - liveKeys).forEach { holder.removeState(it) }
+        knownKeys.retainAll(liveKeys)
+        knownKeys.addAll(liveKeys)
+    }
+
     val screen = stack.last()
     CompositionLocalProvider(LocalProfileName provides session.active?.name) {
-        holder.SaveableStateProvider(key = "${stack.lastIndex}:${screen.hashCode()}") {
+        holder.SaveableStateProvider(key = stateKey(stack.lastIndex, screen)) {
             when (screen) {
                 is Screen.EditProfile -> EditProfileScreen(
                     existing = session.profile(screen.id),
@@ -123,6 +142,9 @@ fun App(store: CredentialStore) {
                 is Screen.Logs -> LogsScreen(session, screen.ns, screen.pod, screen.container, nav)
                 is Screen.Exec -> ExecScreen(session, screen.ns, screen.pod, screen.container, nav)
                 is Screen.Yaml -> YamlScreen(session, screen.title, screen.path, screen.namespace, nav)
+                is Screen.OtherKinds -> OtherKindsScreen(session, screen.namespace, nav)
+                is Screen.KindList -> KindListScreen(session, screen.kind, screen.namespace, nav)
+                is Screen.SecretView -> SecretScreen(session, screen.ns, screen.name, nav)
             }
         }
     }

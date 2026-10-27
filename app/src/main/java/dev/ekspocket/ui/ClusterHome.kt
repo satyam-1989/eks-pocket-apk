@@ -2,20 +2,33 @@
 
 package dev.ekspocket.ui
 
+import androidx.compose.foundation.clickable
+import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.layout.*
+import androidx.compose.foundation.lazy.LazyColumn
+import androidx.compose.foundation.lazy.items
+import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Add
 import androidx.compose.material.icons.filled.ArrowDropDown
+import androidx.compose.material.icons.filled.Check
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.runtime.saveable.rememberSaveable
+import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.clip
+import androidx.compose.ui.focus.FocusRequester
+import androidx.compose.ui.focus.focusRequester
+import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import dev.ekspocket.Nav
 import dev.ekspocket.Screen
 import dev.ekspocket.aws.EksCluster
 import dev.ekspocket.data.Session
+import dev.ekspocket.k8s.BUILTIN_KINDS
 import dev.ekspocket.k8s.K8sClient
 import dev.ekspocket.k8s.age
 import dev.ekspocket.k8s.meta
@@ -37,7 +50,11 @@ fun ClusterHomeScreen(session: Session, cluster: EksCluster, nav: Nav) {
     }
 
     var ns by rememberSaveable { mutableStateOf<String?>("default") }
-    var tab by rememberSaveable { mutableIntStateOf(0) }
+    var selected by rememberSaveable { mutableStateOf("pods") }
+    val kind = BUILTIN_KINDS.firstOrNull { it.plural == selected } ?: BUILTIN_KINDS.first()
+    var filterText by rememberSaveable { mutableStateOf("") }
+    var filterRegex by rememberSaveable { mutableStateOf(false) }
+    val filter = remember(filterText, filterRegex) { NameFilter(filterText, filterRegex) }
     val nsLoader = rememberLoader(k8s) { k8s.namespaces() }
     val snackbar = remember { SnackbarHostState() }
     val actions = rememberActions(snackbar)
@@ -57,82 +74,188 @@ fun ClusterHomeScreen(session: Session, cluster: EksCluster, nav: Nav) {
         },
     ) { pad ->
         Column(Modifier.padding(pad).fillMaxSize()) {
-            TabRow(selectedTabIndex = tab) {
-                listOf("Pods", "Deployments", "Services", "Nodes").forEachIndexed { i, t ->
-                    Tab(
-                        selected = tab == i,
-                        onClick = { tab = i },
-                        text = { Text(t, maxLines = 1, overflow = TextOverflow.Ellipsis) },
-                    )
-                }
-            }
-            when (tab) {
-                0 -> PodsTab(k8s, ns, nav)
-                1 -> DeploymentsTab(k8s, ns, nav, actions)
-                2 -> ServicesTab(k8s, ns, nav, actions)
-                else -> NodesTab(k8s, nav, actions)
+            KindChips(
+                selected = kind.plural,
+                onSelect = { selected = it },
+                onOther = { nav.push(Screen.OtherKinds(ns)) },
+            )
+            FilterBar(
+                text = filterText,
+                regex = filterRegex,
+                error = filter.error,
+                onText = { filterText = it },
+                onRegex = { filterRegex = it },
+                modifier = Modifier.padding(horizontal = 12.dp),
+            )
+            when (kind.plural) {
+                "pods" -> PodsTab(k8s, ns, nav, filter)
+                "deployments" -> DeploymentsTab(k8s, ns, nav, actions, filter)
+                "services" -> ServicesTab(k8s, ns, nav, actions, filter)
+                "nodes" -> NodesTab(k8s, nav, actions, filter)
+                else -> GenericTab(k8s, kind, ns, nav, actions, filter)
             }
         }
     }
 }
 
+/** Scrollable row of kind chips, grouped by area, plus a way into every other kind. */
 @Composable
-private fun NamespacePicker(selected: String?, namespaces: List<String>?, onSelect: (String?) -> Unit) {
-    var open by remember { mutableStateOf(false) }
-    var typing by remember { mutableStateOf(false) }
-    Box {
-        TextButton(onClick = { open = true }) {
+private fun KindChips(selected: String, onSelect: (String) -> Unit, onOther: () -> Unit) {
+    Row(
+        Modifier
+            .fillMaxWidth()
+            .horizontalScroll(rememberScrollState())
+            .padding(horizontal = 8.dp, vertical = 4.dp),
+        verticalAlignment = Alignment.CenterVertically,
+        horizontalArrangement = Arrangement.spacedBy(6.dp),
+    ) {
+        BUILTIN_KINDS.groupBy { it.section }.forEach { (section, kinds) ->
             Text(
-                selected ?: "All namespaces",
-                fontFamily = Mono,
-                maxLines = 1,
-                overflow = TextOverflow.Ellipsis,
-                modifier = Modifier.widthIn(max = 130.dp),
+                section.uppercase(),
+                style = MaterialTheme.typography.labelSmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                modifier = Modifier.padding(start = 8.dp, end = 2.dp),
             )
-            Icon(Icons.Filled.ArrowDropDown, contentDescription = "Change namespace")
-        }
-        DropdownMenu(
-            expanded = open,
-            onDismissRequest = { open = false },
-            modifier = Modifier.heightIn(max = 460.dp),
-        ) {
-            DropdownMenuItem(text = { Text("All namespaces") }, onClick = { onSelect(null); open = false })
-            DropdownMenuItem(text = { Text("Type a namespace") }, onClick = { typing = true; open = false })
-            HorizontalDivider()
-            if (namespaces == null) {
-                DropdownMenuItem(text = { Text("Namespaces not listed yet") }, onClick = {}, enabled = false)
-            }
-            namespaces.orEmpty().forEach { n ->
-                DropdownMenuItem(
-                    text = { Text(n, fontFamily = Mono) },
-                    onClick = { onSelect(n); open = false },
+            kinds.forEach { k ->
+                FilterChip(
+                    selected = k.plural == selected,
+                    onClick = { onSelect(k.plural) },
+                    label = { Text(k.label) },
                 )
             }
         }
+        Spacer(Modifier.width(4.dp))
+        AssistChip(onClick = onOther, label = { Text("Other kinds") })
     }
-    if (typing) {
-        var value by remember { mutableStateOf(selected.orEmpty()) }
-        AlertDialog(
-            onDismissRequest = { typing = false },
-            title = { Text("Namespace") },
-            text = {
-                OutlinedTextField(value = value, onValueChange = { value = it.trim() }, singleLine = true)
+}
+
+@Composable
+fun NamespacePicker(selected: String?, namespaces: List<String>?, onSelect: (String?) -> Unit) {
+    var open by remember { mutableStateOf(false) }
+    TextButton(onClick = { open = true }) {
+        Text(
+            selected ?: "All namespaces",
+            fontFamily = Mono,
+            maxLines = 1,
+            overflow = TextOverflow.Ellipsis,
+            modifier = Modifier.widthIn(max = 130.dp),
+        )
+        Icon(Icons.Filled.ArrowDropDown, contentDescription = "Change namespace")
+    }
+    if (open) {
+        NamespaceDialog(
+            selected = selected,
+            namespaces = namespaces,
+            onSelect = {
+                onSelect(it)
+                open = false
             },
-            confirmButton = {
-                TextButton(
-                    enabled = value.isNotBlank(),
-                    onClick = { onSelect(value); typing = false },
-                ) { Text("Show") }
-            },
-            dismissButton = { TextButton(onClick = { typing = false }) { Text("Cancel") } },
+            onDismiss = { open = false },
         )
     }
 }
 
 @Composable
-private fun PodsTab(k8s: K8sClient, ns: String?, nav: Nav) {
+private fun NamespaceDialog(
+    selected: String?,
+    namespaces: List<String>?,
+    onSelect: (String?) -> Unit,
+    onDismiss: () -> Unit,
+) {
+    var query by remember { mutableStateOf("") }
+    var regex by remember { mutableStateOf(false) }
+    val filter = remember(query, regex) { NameFilter(query, regex) }
+    val shown = namespaces.orEmpty().filter { filter.matches(listOf(it)) }
+    val focus = remember { FocusRequester() }
+    LaunchedEffect(Unit) { runCatching { focus.requestFocus() } }
+
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        title = { Text("Namespace") },
+        text = {
+            Column {
+                FilterBar(
+                    text = query,
+                    regex = regex,
+                    error = filter.error,
+                    onText = { query = it },
+                    onRegex = { regex = it },
+                    modifier = Modifier.focusRequester(focus),
+                )
+                Spacer(Modifier.height(6.dp))
+                LazyColumn(Modifier.heightIn(max = 360.dp)) {
+                    if (!filter.active) {
+                        item { NamespaceRow("All namespaces", selected == null, mono = false) { onSelect(null) } }
+                    }
+                    if (namespaces == null) {
+                        item {
+                            Text(
+                                "Namespaces couldn't be listed. Type the exact name to use it.",
+                                style = MaterialTheme.typography.bodySmall,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                modifier = Modifier.padding(vertical = 8.dp),
+                            )
+                        }
+                    } else if (shown.isEmpty()) {
+                        item {
+                            Text(
+                                "No namespaces match",
+                                style = MaterialTheme.typography.bodySmall,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                modifier = Modifier.padding(vertical = 8.dp),
+                            )
+                        }
+                    }
+                    items(shown, key = { it }) { n ->
+                        NamespaceRow(n, n == selected, mono = true) { onSelect(n) }
+                    }
+                }
+                val exact = query.trim()
+                val canUseExact = exact.isNotEmpty() && !regex && !exact.startsWith("!") &&
+                    namespaces?.contains(exact) != true
+                if (canUseExact) {
+                    TextButton(onClick = { onSelect(exact) }) {
+                        Text("Use \"$exact\"", fontFamily = Mono, maxLines = 1, overflow = TextOverflow.Ellipsis)
+                    }
+                }
+            }
+        },
+        confirmButton = { TextButton(onClick = onDismiss) { Text("Close") } },
+    )
+}
+
+@Composable
+private fun NamespaceRow(label: String, selected: Boolean, mono: Boolean, onClick: () -> Unit) {
+    Row(
+        Modifier
+            .fillMaxWidth()
+            .clip(RoundedCornerShape(8.dp))
+            .clickable(onClick = onClick)
+            .padding(horizontal = 8.dp, vertical = 12.dp),
+        verticalAlignment = Alignment.CenterVertically,
+    ) {
+        Text(
+            label,
+            fontFamily = if (mono) Mono else null,
+            fontWeight = if (selected) FontWeight.SemiBold else null,
+            color = if (selected) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.onSurface,
+            maxLines = 1,
+            overflow = TextOverflow.Ellipsis,
+            modifier = Modifier.weight(1f),
+        )
+        if (selected) Icon(Icons.Filled.Check, contentDescription = "Selected", tint = MaterialTheme.colorScheme.primary)
+    }
+}
+
+@Composable
+private fun PodsTab(k8s: K8sClient, ns: String?, nav: Nav, filter: NameFilter) {
     val loader = rememberLoader(k8s, ns) { k8s.pods(ns).sortedBy { it.meta("name") } }
-    ResourceList(loader, "No pods here", key = { "${it.meta("namespace")}/${it.meta("name")}" }) { p ->
+    ResourceList(
+        loader, "No pods here",
+        key = { "${it.meta("namespace")}/${it.meta("name")}" },
+        filter = filter,
+        fields = { listOf(it.meta("name"), if (ns == null) it.meta("namespace") else null) },
+    ) { p ->
         val s = podSummary(p)
         val facts = buildList {
             if (ns == null) add(p.meta("namespace"))
@@ -150,12 +273,17 @@ private fun PodsTab(k8s: K8sClient, ns: String?, nav: Nav) {
 }
 
 @Composable
-private fun DeploymentsTab(k8s: K8sClient, ns: String?, nav: Nav, actions: Actions) {
+private fun DeploymentsTab(k8s: K8sClient, ns: String?, nav: Nav, actions: Actions, filter: NameFilter) {
     val loader = rememberLoader(k8s, ns) { k8s.deployments(ns).sortedBy { it.meta("name") } }
     var scaling by remember { mutableStateOf<JSONObject?>(null) }
     var deleting by remember { mutableStateOf<JSONObject?>(null) }
 
-    ResourceList(loader, "No deployments here", key = { "${it.meta("namespace")}/${it.meta("name")}" }) { d ->
+    ResourceList(
+        loader, "No deployments here",
+        key = { "${it.meta("namespace")}/${it.meta("name")}" },
+        filter = filter,
+        fields = { listOf(it.meta("name"), if (ns == null) it.meta("namespace") else null) },
+    ) { d ->
         val dns = d.meta("namespace")
         val name = d.meta("name")
         val path = "/apis/apps/v1/namespaces/$dns/deployments/$name"
@@ -224,11 +352,16 @@ private fun DeploymentsTab(k8s: K8sClient, ns: String?, nav: Nav, actions: Actio
 }
 
 @Composable
-private fun ServicesTab(k8s: K8sClient, ns: String?, nav: Nav, actions: Actions) {
+private fun ServicesTab(k8s: K8sClient, ns: String?, nav: Nav, actions: Actions, filter: NameFilter) {
     val loader = rememberLoader(k8s, ns) { k8s.services(ns).sortedBy { it.meta("name") } }
     var deleting by remember { mutableStateOf<JSONObject?>(null) }
 
-    ResourceList(loader, "No services here", key = { "${it.meta("namespace")}/${it.meta("name")}" }) { s ->
+    ResourceList(
+        loader, "No services here",
+        key = { "${it.meta("namespace")}/${it.meta("name")}" },
+        filter = filter,
+        fields = { listOf(it.meta("name"), if (ns == null) it.meta("namespace") else null) },
+    ) { s ->
         val sns = s.meta("namespace")
         val name = s.meta("name")
         val path = "/api/v1/namespaces/$sns/services/$name"
@@ -281,9 +414,14 @@ private fun ServicesTab(k8s: K8sClient, ns: String?, nav: Nav, actions: Actions)
 }
 
 @Composable
-private fun NodesTab(k8s: K8sClient, nav: Nav, actions: Actions) {
+private fun NodesTab(k8s: K8sClient, nav: Nav, actions: Actions, filter: NameFilter) {
     val loader = rememberLoader(k8s) { k8s.nodes().sortedBy { it.meta("name") } }
-    ResourceList(loader, "No nodes. Fargate-only clusters don't show EC2 nodes.", key = { it.meta("name") }) { n ->
+    ResourceList(
+        loader, "No nodes. Fargate-only clusters don't show EC2 nodes.",
+        key = { it.meta("name") },
+        filter = filter,
+        fields = { listOf(it.meta("name")) },
+    ) { n ->
         val name = n.meta("name")
         val ready = n.optJSONObject("status")?.optJSONArray("conditions").objects()
             .firstOrNull { it.optString("type") == "Ready" }?.optString("status") == "True"

@@ -41,6 +41,7 @@ fun YamlScreen(session: Session, title: String, path: String?, namespace: String
     var reloadKey by remember { mutableIntStateOf(0) }
     val snackbar = remember { SnackbarHostState() }
     val actions = rememberActions(snackbar)
+    if (path?.contains("/secrets/") == true || text.contains("kind: Secret")) SecureWindow()
 
     LaunchedEffect(path, reloadKey) {
         if (path == null) return@LaunchedEffect

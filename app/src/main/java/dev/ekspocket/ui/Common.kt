@@ -2,6 +2,10 @@
 
 package dev.ekspocket.ui
 
+import android.app.Activity
+import android.content.Context
+import android.content.ContextWrapper
+import android.view.WindowManager
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.isSystemInDarkTheme
@@ -14,6 +18,8 @@ import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.ArrowBack
 import androidx.compose.material.icons.filled.ArrowDropDown
+import androidx.compose.material.icons.filled.Clear
+import androidx.compose.material.icons.filled.Search
 import androidx.compose.material.icons.filled.MoreVert
 import androidx.compose.material3.*
 import androidx.compose.material3.pulltorefresh.PullToRefreshBox
@@ -22,8 +28,10 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.input.ImeAction
 import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
@@ -88,10 +96,11 @@ object StatusColors {
 
 private val OK_STATES = setOf(
     "Running", "Active", "ACTIVE", "Ready", "Succeeded", "Completed", "Available", "Bound",
+    "Healthy", "Synced", "True",
 )
 private val WARN_STATES = setOf(
     "Pending", "ContainerCreating", "PodInitializing", "Terminating", "CREATING", "UPDATING",
-    "Progressing", "Cordoned",
+    "Progressing", "Cordoned", "Released", "OutOfSync", "Suspended",
 )
 
 fun statusColor(s: String): Color = when {
@@ -99,6 +108,111 @@ fun statusColor(s: String): Color = when {
     s in WARN_STATES -> StatusColors.warn
     s.isBlank() || s == "Unknown" || s.startsWith("Scaled") -> StatusColors.idle
     else -> StatusColors.bad
+}
+
+/** Blocks screenshots and the recent-apps preview while the calling screen is shown. */
+@Composable
+fun SecureWindow() {
+    val context = LocalContext.current
+    DisposableEffect(Unit) {
+        val window = context.findActivity()?.window
+        window?.addFlags(WindowManager.LayoutParams.FLAG_SECURE)
+        onDispose { window?.clearFlags(WindowManager.LayoutParams.FLAG_SECURE) }
+    }
+}
+
+private tailrec fun Context.findActivity(): Activity? = when (this) {
+    is Activity -> this
+    is ContextWrapper -> baseContext.findActivity()
+    else -> null
+}
+
+// ---------- Filtering ----------
+
+/**
+ * Name filter. Plain text is a case-insensitive "contains" match; with [regex] it's a
+ * case-insensitive regex. A leading "!" excludes matches instead (like k9s).
+ */
+class NameFilter(val text: String, val regex: Boolean) {
+    private val negate = text.startsWith("!")
+    private val pattern = text.removePrefix("!").trim()
+    private val re: Regex?
+    val error: String?
+
+    init {
+        if (regex && pattern.isNotEmpty()) {
+            val compiled = runCatching { Regex(pattern, RegexOption.IGNORE_CASE) }
+            re = compiled.getOrNull()
+            error = compiled.exceptionOrNull()?.let { e ->
+                "Invalid regex" + (e.message?.lineSequence()?.firstOrNull()?.let { ": $it" } ?: "")
+            }
+        } else {
+            re = null
+            error = null
+        }
+    }
+
+    val active: Boolean get() = pattern.isNotEmpty() && error == null
+
+    fun matches(fields: List<String?>): Boolean {
+        if (!active) return true
+        val hit = fields.filterNotNull().any { f ->
+            if (re != null) re.containsMatchIn(f) else f.contains(pattern, ignoreCase = true)
+        }
+        return hit != negate
+    }
+}
+
+@Composable
+fun FilterBar(
+    text: String,
+    regex: Boolean,
+    error: String?,
+    onText: (String) -> Unit,
+    onRegex: (Boolean) -> Unit,
+    modifier: Modifier = Modifier,
+) {
+    OutlinedTextField(
+        value = text,
+        onValueChange = onText,
+        singleLine = true,
+        placeholder = {
+            Text(
+                if (regex) "Regex, e.g. ^api-.*   ! excludes" else "Filter by name   ! excludes",
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis,
+            )
+        },
+        leadingIcon = { Icon(Icons.Filled.Search, contentDescription = null) },
+        trailingIcon = {
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                if (text.isNotEmpty()) {
+                    IconButton(onClick = { onText("") }) {
+                        Icon(Icons.Filled.Clear, contentDescription = "Clear filter")
+                    }
+                }
+                FilterChip(
+                    selected = regex,
+                    onClick = { onRegex(!regex) },
+                    label = { Text(".*", fontFamily = Mono, fontWeight = FontWeight.Bold) },
+                    modifier = Modifier.padding(end = 8.dp),
+                )
+            }
+        },
+        isError = error != null,
+        supportingText = if (error != null) {
+            { Text(error, maxLines = 2) }
+        } else {
+            null
+        },
+        textStyle = MaterialTheme.typography.bodyMedium.copy(fontFamily = Mono),
+        keyboardOptions = KeyboardOptions(
+            autoCorrectEnabled = false,
+            keyboardType = KeyboardType.Ascii,
+            imeAction = ImeAction.Search,
+        ),
+        modifier = modifier.fillMaxWidth(),
+    )
 }
 
 // ---------- Async helpers ----------
@@ -372,6 +486,8 @@ fun <T> ResourceList(
     loader: Loader<List<T>>,
     emptyText: String,
     key: (T) -> String,
+    filter: NameFilter? = null,
+    fields: (T) -> List<String?> = { emptyList() },
     row: @Composable (T) -> Unit,
 ) {
     PullToRefreshBox(
@@ -387,8 +503,26 @@ fun <T> ResourceList(
             val err = loader.error
             if (err != null) item { ErrorCard(err, onRetry = { loader.reload() }) }
             val data = loader.data
-            if (data != null && data.isEmpty()) item { EmptyState(emptyText) }
-            items(data.orEmpty(), key = key) { row(it) }
+            val shown = if (data != null && filter != null && filter.active) {
+                data.filter { filter.matches(fields(it)) }
+            } else {
+                data
+            }
+            if (data != null && filter != null && filter.active && data.isNotEmpty()) {
+                item {
+                    Text(
+                        "${shown?.size ?: 0} of ${data.size} match",
+                        style = MaterialTheme.typography.labelMedium,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        modifier = Modifier.padding(horizontal = 4.dp),
+                    )
+                }
+            }
+            when {
+                data != null && data.isEmpty() -> item { EmptyState(emptyText) }
+                shown != null && shown.isEmpty() -> item { EmptyState("Nothing matches the filter") }
+            }
+            items(shown.orEmpty(), key = key) { row(it) }
         }
     }
 }

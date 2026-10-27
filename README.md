@@ -8,10 +8,18 @@ It signs AWS requests itself with your access key, lists your EKS clusters, and 
 
 - Saves several AWS profiles (for example prod, staging, a client account) and switches between them in one tap. The active profile name shows at the top of every screen.
 - Lists EKS clusters per region and shows status, version, and endpoint access.
-- Browses pods, deployments, services, and nodes, in one namespace or all of them.
+- Browses, in one namespace or all of them:
+  - Workloads: pods, deployments, StatefulSets, ReplicaSets
+  - Network: services, ingresses, network policies
+  - Config: ConfigMaps, Secrets (values masked until you tap Reveal; screenshots blocked)
+  - Storage: PVCs, PVs, StorageClasses
+  - Access: Roles, RoleBindings, ClusterRoles, ClusterRoleBindings
+  - Cluster: nodes
+- Filters every list by name as you type. Plain text matches anywhere in the name (case-insensitive); tap `.*` for regex such as `^api-.*-v2$` or `(worker|cron)`; start with `!` to exclude, like k9s. The namespace picker has the same search.
+- "Other kinds" lists every resource type the cluster serves, including CRDs such as Argo CD Applications, with search.
 - Streams pod logs live, including the previous container's logs after a crash.
 - Opens an interactive shell inside a container (bash if present, otherwise sh).
-- Scales and restarts deployments, deletes pods, deployments, and services, and cordons or uncordons nodes.
+- Scales and restarts deployments and StatefulSets, scales ReplicaSets, restarts DaemonSets, deletes any resource, and cordons or uncordons nodes.
 - Views and edits any of those resources as YAML, and applies new YAML (multiple documents supported) with server-side apply.
 
 ## Build the APK with GitHub Actions

@@ -18,8 +18,8 @@ android {
         applicationId = "dev.ekspocket"
         minSdk = 36 // Android 16
         targetSdk = 36
-        versionCode = 2
-        versionName = "1.1"
+        versionCode = 3
+        versionName = "1.2"
     }
 
     signingConfigs {

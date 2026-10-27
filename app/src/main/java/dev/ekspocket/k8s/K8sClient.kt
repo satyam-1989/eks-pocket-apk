@@ -16,6 +16,9 @@ import java.security.KeyStore
 import java.security.cert.CertificateFactory
 import java.time.Instant
 import java.util.Base64
+import java.util.concurrent.Callable
+import java.util.concurrent.ConcurrentHashMap
+import java.util.concurrent.Executors
 import java.util.concurrent.TimeUnit
 import javax.net.ssl.SSLContext
 import javax.net.ssl.TrustManagerFactory
@@ -30,7 +33,7 @@ class K8sClient(
     private val base = cluster.endpoint.trimEnd('/')
     private var token: String? = null
     private var tokenAt = 0L
-    private val discovery = HashMap<String, JSONArray>()
+    private val discovery = ConcurrentHashMap<String, JSONArray>()
 
     private val http: OkHttpClient
     private val streamHttp: OkHttpClient
@@ -141,6 +144,23 @@ class K8sClient(
         request("PATCH", "/apis/apps/v1/namespaces/$ns/deployments/$name", body.toString(), MERGE)
     }
 
+    /** Scale any workload that has a /scale subresource. */
+    fun scaleAt(itemPath: String, replicas: Int) {
+        val body = JSONObject().put("spec", JSONObject().put("replicas", replicas))
+        request("PATCH", "$itemPath/scale", body.toString(), MERGE)
+    }
+
+    /** Rolling restart (what kubectl rollout restart does) for any pod-template workload. */
+    fun restartAt(itemPath: String) {
+        val annotations = JSONObject().put("kubectl.kubernetes.io/restartedAt", Instant.now().toString())
+        val body = JSONObject().put(
+            "spec", JSONObject().put(
+                "template", JSONObject().put("metadata", JSONObject().put("annotations", annotations))
+            )
+        )
+        request("PATCH", itemPath, body.toString(), MERGE)
+    }
+
     fun setUnschedulable(node: String, value: Boolean) {
         val body = JSONObject().put("spec", JSONObject().put("unschedulable", value))
         request("PATCH", "/api/v1/nodes/$node", body.toString(), MERGE)
@@ -148,9 +168,50 @@ class K8sClient(
 
     // ---- Discovery and YAML apply ----
 
-    @Synchronized
     private fun resources(groupPath: String): JSONArray =
-        discovery.getOrPut(groupPath) { getJson(groupPath).getJSONArray("resources") }
+        discovery[groupPath] ?: getJson(groupPath).getJSONArray("resources").also { discovery[groupPath] = it }
+
+    /** Every listable resource type the cluster serves, including CRDs (preferred versions only). */
+    fun discoverKinds(): List<Kind> {
+        val groupVersions = mutableListOf<String>()
+        getJson("/api").optJSONArray("versions")?.let { a ->
+            for (i in 0 until a.length()) groupVersions += a.getString(i)
+        }
+        getJson("/apis").optJSONArray("groups").objects().forEach { g ->
+            g.optJSONObject("preferredVersion")?.optString("groupVersion")
+                ?.takeIf { it.isNotBlank() }
+                ?.let { groupVersions += it }
+        }
+        val pool = Executors.newFixedThreadPool(6)
+        try {
+            val futures = groupVersions.map { gv ->
+                pool.submit(Callable { runCatching { kindsIn(gv) }.getOrDefault(emptyList()) })
+            }
+            return futures.flatMap { it.get() }
+                .distinctBy { "${it.apiPath}/${it.plural}" }
+                .sortedWith(compareBy<Kind> { it.group != "core" }.thenBy { it.group }.thenBy { it.kind })
+        } finally {
+            pool.shutdown()
+        }
+    }
+
+    private fun kindsIn(groupVersion: String): List<Kind> {
+        val apiPath = if (groupVersion.contains('/')) "/apis/$groupVersion" else "/api/$groupVersion"
+        return resources(apiPath).objects()
+            .filter { r ->
+                val verbs = r.optJSONArray("verbs")
+                !r.optString("name").contains('/') &&
+                    verbs != null && (0 until verbs.length()).any { verbs.optString(it) == "list" }
+            }
+            .map { r ->
+                Kind(
+                    kind = r.optString("kind"),
+                    plural = r.getString("name"),
+                    apiPath = apiPath,
+                    namespaced = r.optBoolean("namespaced"),
+                )
+            }
+    }
 
     fun pathFor(apiVersion: String, kind: String, namespace: String?, name: String?): String {
         val groupPath = if (apiVersion.contains('/')) "/apis/$apiVersion" else "/api/$apiVersion"
