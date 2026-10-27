@@ -13,15 +13,19 @@ import dev.ekspocket.aws.EksCluster
 import dev.ekspocket.aws.EksToken
 import dev.ekspocket.k8s.K8sClient
 import okhttp3.OkHttpClient
+import org.json.JSONArray
 import org.json.JSONObject
 import java.security.KeyStore
+import java.util.UUID
 import java.util.concurrent.TimeUnit
 import javax.crypto.Cipher
 import javax.crypto.KeyGenerator
 import javax.crypto.SecretKey
 import javax.crypto.spec.GCMParameterSpec
 
-data class StoredConfig(
+data class Profile(
+    val id: String,
+    val name: String,
     val accessKeyId: String,
     val secretAccessKey: String,
     val sessionToken: String?,
@@ -30,9 +34,21 @@ data class StoredConfig(
     fun credentials() = AwsCredentials(
         accessKeyId, secretAccessKey, sessionToken?.takeIf { it.isNotBlank() },
     )
+
+    val maskedKey: String
+        get() = if (accessKeyId.length > 8) "${accessKeyId.take(4)}…${accessKeyId.takeLast(4)}" else accessKeyId
+
+    companion object {
+        fun newId(): String = UUID.randomUUID().toString()
+    }
 }
 
-/** Stores keys encrypted with an AES-GCM key that never leaves the Android Keystore. */
+data class ProfileState(
+    val profiles: List<Profile> = emptyList(),
+    val activeId: String? = null,
+)
+
+/** Stores all profiles encrypted with an AES-GCM key that never leaves the Android Keystore. */
 class CredentialStore(context: Context) {
     private val prefs = context.getSharedPreferences("ekspocket", Context.MODE_PRIVATE)
 
@@ -52,12 +68,27 @@ class CredentialStore(context: Context) {
         return gen.generateKey()
     }
 
-    fun save(cfg: StoredConfig) {
+    fun save(state: ProfileState) {
+        if (state.profiles.isEmpty()) {
+            clear()
+            return
+        }
+        val arr = JSONArray()
+        state.profiles.forEach { p ->
+            arr.put(
+                JSONObject()
+                    .put("id", p.id)
+                    .put("name", p.name)
+                    .put("ak", p.accessKeyId)
+                    .put("sk", p.secretAccessKey)
+                    .put("st", p.sessionToken ?: "")
+                    .put("region", p.region)
+            )
+        }
         val json = JSONObject()
-            .put("ak", cfg.accessKeyId)
-            .put("sk", cfg.secretAccessKey)
-            .put("st", cfg.sessionToken ?: "")
-            .put("region", cfg.region)
+            .put("version", 2)
+            .put("active", state.activeId ?: "")
+            .put("profiles", arr)
             .toString()
         val cipher = Cipher.getInstance(TRANSFORM)
         cipher.init(Cipher.ENCRYPT_MODE, key())
@@ -68,10 +99,10 @@ class CredentialStore(context: Context) {
             .apply()
     }
 
-    fun load(): StoredConfig? {
+    fun load(): ProfileState {
         return try {
-            val iv = prefs.getString("iv", null) ?: return null
-            val ct = prefs.getString("ct", null) ?: return null
+            val iv = prefs.getString("iv", null) ?: return ProfileState()
+            val ct = prefs.getString("ct", null) ?: return ProfileState()
             val cipher = Cipher.getInstance(TRANSFORM)
             cipher.init(
                 Cipher.DECRYPT_MODE, key(),
@@ -79,15 +110,41 @@ class CredentialStore(context: Context) {
             )
             val plain = cipher.doFinal(Base64.decode(ct, Base64.NO_WRAP))
             val o = JSONObject(String(plain, Charsets.UTF_8))
-            StoredConfig(
-                accessKeyId = o.getString("ak"),
-                secretAccessKey = o.getString("sk"),
-                sessionToken = o.optString("st").ifBlank { null },
-                region = o.optString("region", "us-east-1"),
-            )
+            if (o.has("profiles")) parseV2(o) else migrateV1(o)
         } catch (e: Exception) {
-            null
+            ProfileState()
         }
+    }
+
+    private fun parseV2(o: JSONObject): ProfileState {
+        val arr = o.getJSONArray("profiles")
+        val profiles = (0 until arr.length()).map { i ->
+            val p = arr.getJSONObject(i)
+            Profile(
+                id = p.getString("id"),
+                name = p.getString("name"),
+                accessKeyId = p.getString("ak"),
+                secretAccessKey = p.getString("sk"),
+                sessionToken = p.optString("st").ifBlank { null },
+                region = p.optString("region", "us-east-1"),
+            )
+        }
+        return ProfileState(profiles, o.optString("active").ifBlank { null })
+    }
+
+    /** Version 1 stored a single key set; it becomes a profile named "default". */
+    private fun migrateV1(o: JSONObject): ProfileState {
+        val p = Profile(
+            id = Profile.newId(),
+            name = "default",
+            accessKeyId = o.getString("ak"),
+            secretAccessKey = o.getString("sk"),
+            sessionToken = o.optString("st").ifBlank { null },
+            region = o.optString("region", "us-east-1"),
+        )
+        val state = ProfileState(listOf(p), p.id)
+        save(state)
+        return state
     }
 
     fun clear() {
@@ -105,7 +162,7 @@ class CredentialStore(context: Context) {
 }
 
 class Session(private val store: CredentialStore) {
-    var config by mutableStateOf(store.load())
+    var state by mutableStateOf(store.load())
         private set
 
     var k8s: K8sClient? = null
@@ -116,32 +173,61 @@ class Session(private val store: CredentialStore) {
         .readTimeout(30, TimeUnit.SECONDS)
         .build()
 
-    val region: String get() = config?.region ?: "us-east-1"
+    val active: Profile?
+        get() = state.profiles.firstOrNull { it.id == state.activeId } ?: state.profiles.firstOrNull()
 
-    fun save(cfg: StoredConfig) {
-        store.save(cfg)
-        config = cfg
+    val region: String get() = active?.region ?: "us-east-1"
+
+    fun profile(id: String?): Profile? = state.profiles.firstOrNull { it.id == id }
+
+    fun nameTaken(name: String, exceptId: String?): Boolean =
+        state.profiles.any { it.id != exceptId && it.name.equals(name.trim(), ignoreCase = true) }
+
+    private fun persist(next: ProfileState) {
+        val previousActive = active?.id
+        store.save(next)
+        state = next
+        if (active?.id != previousActive) k8s = null
     }
 
-    fun setRegion(region: String) {
-        config?.let { save(it.copy(region = region)) }
-    }
-
-    fun signOut() {
-        store.clear()
-        config = null
+    /** Adds or updates [profile] and makes it the active one. */
+    fun upsert(profile: Profile) {
+        val exists = state.profiles.any { it.id == profile.id }
+        val list = if (exists) {
+            state.profiles.map { if (it.id == profile.id) profile else it }
+        } else {
+            state.profiles + profile
+        }
+        persist(ProfileState(list, profile.id))
         k8s = null
     }
 
+    fun switchTo(id: String) {
+        if (active?.id != id) persist(state.copy(activeId = id))
+    }
+
+    fun delete(id: String) {
+        val list = state.profiles.filterNot { it.id == id }
+        val nextActive = if (active?.id == id) list.firstOrNull()?.id else active?.id
+        persist(ProfileState(list, nextActive))
+    }
+
+    fun setRegion(region: String) {
+        val p = active ?: return
+        if (p.region != region) persist(state.copy(profiles = state.profiles.map {
+            if (it.id == p.id) it.copy(region = region) else it
+        }))
+    }
+
     fun eks(): EksClient {
-        val c = config ?: error("No AWS keys saved")
-        return EksClient(c.credentials(), c.region, http)
+        val p = active ?: error("No AWS profile selected")
+        return EksClient(p.credentials(), p.region, http)
     }
 
     fun connect(cluster: EksCluster): K8sClient {
-        val c = config ?: error("No AWS keys saved")
-        val creds = c.credentials()
-        val region = c.region
+        val p = active ?: error("No AWS profile selected")
+        val creds = p.credentials()
+        val region = p.region
         return K8sClient(cluster) { EksToken.generate(creds, region, cluster.name) }
             .also { k8s = it }
     }

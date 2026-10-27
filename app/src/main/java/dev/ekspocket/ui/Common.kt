@@ -171,6 +171,25 @@ fun rememberActions(snackbar: SnackbarHostState): Actions {
 
 // ---------- Components ----------
 
+/** Name of the active AWS profile, shown in every screen header. */
+val LocalProfileName = compositionLocalOf<String?> { null }
+
+@Composable
+fun ProfileTag(name: String) {
+    Text(
+        name,
+        style = MaterialTheme.typography.labelSmall,
+        fontWeight = FontWeight.SemiBold,
+        color = MaterialTheme.colorScheme.onPrimaryContainer,
+        maxLines = 1,
+        overflow = TextOverflow.Ellipsis,
+        modifier = Modifier
+            .widthIn(max = 140.dp)
+            .background(MaterialTheme.colorScheme.primaryContainer, RoundedCornerShape(4.dp))
+            .padding(horizontal = 6.dp, vertical = 1.dp),
+    )
+}
+
 @Composable
 fun AppScaffold(
     title: String,
@@ -193,14 +212,23 @@ fun AppScaffold(
                             maxLines = 1,
                             overflow = TextOverflow.Ellipsis,
                         )
-                        if (subtitle != null) {
-                            Text(
-                                subtitle,
-                                style = MaterialTheme.typography.labelMedium,
-                                color = MaterialTheme.colorScheme.onSurfaceVariant,
-                                maxLines = 1,
-                                overflow = TextOverflow.Ellipsis,
-                            )
+                        val profile = LocalProfileName.current
+                        if (subtitle != null || profile != null) {
+                            Row(verticalAlignment = Alignment.CenterVertically) {
+                                if (profile != null) {
+                                    ProfileTag(profile)
+                                    if (subtitle != null) Spacer(Modifier.width(8.dp))
+                                }
+                                if (subtitle != null) {
+                                    Text(
+                                        subtitle,
+                                        style = MaterialTheme.typography.labelMedium,
+                                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                        maxLines = 1,
+                                        overflow = TextOverflow.Ellipsis,
+                                    )
+                                }
+                            }
                         }
                     }
                 },

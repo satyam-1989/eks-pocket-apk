@@ -11,8 +11,11 @@ import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.filled.AccountCircle
+import androidx.compose.material.icons.filled.Add
+import androidx.compose.material.icons.filled.ArrowDropDown
+import androidx.compose.material.icons.filled.Check
 import androidx.compose.material.icons.filled.Refresh
-import androidx.compose.material.icons.filled.Settings
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.runtime.saveable.rememberSaveable
@@ -23,31 +26,41 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.text.input.PasswordVisualTransformation
 import androidx.compose.ui.text.input.VisualTransformation
+import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import dev.ekspocket.aws.EksCluster
+import dev.ekspocket.data.Profile
 import dev.ekspocket.data.REGIONS
 import dev.ekspocket.data.Session
-import dev.ekspocket.data.StoredConfig
+
+// ---------------- Add / edit profile ----------------
 
 @Composable
-fun SetupScreen(
-    initial: StoredConfig?,
+fun EditProfileScreen(
+    existing: Profile?,
+    isFirst: Boolean,
     canGoBack: Boolean,
+    nameTaken: (String) -> Boolean,
     onBack: () -> Unit,
-    onSave: (StoredConfig) -> Unit,
-    onRemoveKeys: (() -> Unit)?,
+    onSave: (Profile) -> Unit,
 ) {
-    var accessKey by rememberSaveable { mutableStateOf(initial?.accessKeyId.orEmpty()) }
-    var secretKey by rememberSaveable { mutableStateOf(initial?.secretAccessKey.orEmpty()) }
-    var sessionToken by rememberSaveable { mutableStateOf(initial?.sessionToken.orEmpty()) }
-    var region by rememberSaveable { mutableStateOf(initial?.region ?: "us-east-1") }
+    var name by rememberSaveable { mutableStateOf(existing?.name ?: if (isFirst) "default" else "") }
+    var accessKey by rememberSaveable { mutableStateOf(existing?.accessKeyId.orEmpty()) }
+    var secretKey by rememberSaveable { mutableStateOf(existing?.secretAccessKey.orEmpty()) }
+    var sessionToken by rememberSaveable { mutableStateOf(existing?.sessionToken.orEmpty()) }
+    var region by rememberSaveable { mutableStateOf(existing?.region ?: "us-east-1") }
     var showSecret by remember { mutableStateOf(false) }
-    var confirmRemove by remember { mutableStateOf(false) }
 
+    val nameError = if (name.isNotBlank() && nameTaken(name)) "Another profile already uses this name" else null
+    val canSave = name.isNotBlank() && nameError == null && accessKey.isNotBlank() && secretKey.isNotBlank()
     val keyboard = KeyboardOptions(autoCorrectEnabled = false, keyboardType = KeyboardType.Password)
 
     AppScaffold(
-        title = if (initial == null) "Connect to AWS" else "AWS keys",
+        title = when {
+            isFirst -> "Connect to AWS"
+            existing == null -> "Add profile"
+            else -> "Edit ${existing.name}"
+        },
         onBack = if (canGoBack) onBack else null,
     ) { pad ->
         Column(
@@ -59,9 +72,19 @@ fun SetupScreen(
             verticalArrangement = Arrangement.spacedBy(14.dp),
         ) {
             Text(
-                "Your keys are encrypted with the Android Keystore and only used to sign requests to AWS.",
+                "Keys are encrypted with the Android Keystore and only used to sign requests to AWS.",
                 style = MaterialTheme.typography.bodyMedium,
                 color = MaterialTheme.colorScheme.onSurfaceVariant,
+            )
+            OutlinedTextField(
+                value = name,
+                onValueChange = { name = it.take(40) },
+                label = { Text("Profile name") },
+                placeholder = { Text("prod, staging, client-a") },
+                singleLine = true,
+                isError = nameError != null,
+                supportingText = { if (nameError != null) Text(nameError) },
+                modifier = Modifier.fillMaxWidth(),
             )
             OutlinedTextField(
                 value = accessKey,
@@ -100,11 +123,20 @@ fun SetupScreen(
             }
             Button(
                 onClick = {
-                    onSave(StoredConfig(accessKey, secretKey, sessionToken.ifBlank { null }, region))
+                    onSave(
+                        Profile(
+                            id = existing?.id ?: Profile.newId(),
+                            name = name.trim(),
+                            accessKeyId = accessKey,
+                            secretAccessKey = secretKey,
+                            sessionToken = sessionToken.ifBlank { null },
+                            region = region,
+                        )
+                    )
                 },
-                enabled = accessKey.isNotBlank() && secretKey.isNotBlank(),
+                enabled = canSave,
                 modifier = Modifier.fillMaxWidth().height(52.dp),
-            ) { Text("Save and show clusters") }
+            ) { Text("Save and use this profile") }
 
             Surface(
                 color = MaterialTheme.colorScheme.secondaryContainer,
@@ -112,42 +144,101 @@ fun SetupScreen(
                 shape = RoundedCornerShape(12.dp),
             ) {
                 Text(
-                    "Use a dedicated IAM user rather than admin keys. It needs eks:ListClusters and " +
-                        "eks:DescribeCluster, plus an EKS access entry on each cluster with only the " +
-                        "Kubernetes permissions you want from your phone.",
+                    "Use a dedicated IAM user per account rather than admin keys. It needs " +
+                        "eks:ListClusters and eks:DescribeCluster, plus an EKS access entry on each " +
+                        "cluster with only the Kubernetes permissions you want from your phone.",
                     style = MaterialTheme.typography.bodySmall,
                     modifier = Modifier.padding(14.dp),
                 )
             }
+        }
+    }
+}
 
-            if (onRemoveKeys != null) {
-                OutlinedButton(
-                    onClick = { confirmRemove = true },
-                    modifier = Modifier.fillMaxWidth(),
-                ) { Text("Remove saved keys") }
+// ---------------- Profile list ----------------
+
+@Composable
+fun ProfilesScreen(
+    session: Session,
+    onBack: () -> Unit,
+    onAdd: () -> Unit,
+    onEdit: (Profile) -> Unit,
+    onUse: (Profile) -> Unit,
+    onDelete: (Profile) -> Unit,
+) {
+    var deleting by remember { mutableStateOf<Profile?>(null) }
+    val activeId = session.active?.id
+
+    AppScaffold(
+        title = "Profiles",
+        onBack = onBack,
+        fab = {
+            ExtendedFloatingActionButton(
+                onClick = onAdd,
+                icon = { Icon(Icons.Filled.Add, contentDescription = null) },
+                text = { Text("Add profile") },
+            )
+        },
+    ) { pad ->
+        LazyColumn(
+            modifier = Modifier.padding(pad).fillMaxSize(),
+            contentPadding = PaddingValues(start = 12.dp, end = 12.dp, top = 8.dp, bottom = 96.dp),
+            verticalArrangement = Arrangement.spacedBy(8.dp),
+        ) {
+            item {
+                Text(
+                    "Tap a profile to switch to it.",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    modifier = Modifier.padding(horizontal = 4.dp, vertical = 4.dp),
+                )
+            }
+            items(session.state.profiles, key = { it.id }) { p ->
+                ResourceRow(
+                    title = p.name,
+                    facts = listOfNotNull(
+                        p.maskedKey,
+                        p.region,
+                        if (p.sessionToken != null) "temporary" else null,
+                    ),
+                    status = if (p.id == activeId) "Active" else null,
+                    onClick = { onUse(p) },
+                    menu = { close ->
+                        DropdownMenuItem(text = { Text("Edit") }, onClick = { close(); onEdit(p) })
+                        DropdownMenuItem(text = { Text("Delete") }, onClick = { close(); deleting = p })
+                    },
+                )
             }
         }
     }
 
-    if (confirmRemove && onRemoveKeys != null) {
+    deleting?.let { p ->
+        val last = session.state.profiles.size == 1
         ConfirmDialog(
-            title = "Remove saved keys?",
-            text = "The keys will be deleted from this phone. You'll need to enter them again to connect.",
-            confirmLabel = "Remove",
-            onConfirm = { confirmRemove = false; onRemoveKeys() },
-            onDismiss = { confirmRemove = false },
+            title = "Delete ${p.name}?",
+            text = if (last) {
+                "This is your only profile. Its keys will be removed from this phone and you'll need to add a profile again."
+            } else {
+                "Its keys will be removed from this phone."
+            },
+            confirmLabel = "Delete",
+            onConfirm = { deleting = null; onDelete(p) },
+            onDismiss = { deleting = null },
         )
     }
 }
+
+// ---------------- Clusters ----------------
 
 @Composable
 fun ClustersScreen(
     session: Session,
     onOpen: (EksCluster) -> Unit,
-    onSettings: () -> Unit,
+    onManageProfiles: () -> Unit,
 ) {
+    val profile = session.active
     val region = session.region
-    val loader = rememberLoader(region, session.config) {
+    val loader = rememberLoader(profile) {
         val eks = session.eks()
         eks.listClusters().map { eks.describeCluster(it) }
     }
@@ -155,21 +246,28 @@ fun ClustersScreen(
     AppScaffold(
         title = "Clusters",
         actions = {
-            SelectorButton(region, REGIONS) { session.setRegion(it) }
             IconButton(onClick = { loader.reload() }) {
                 Icon(Icons.Filled.Refresh, contentDescription = "Refresh")
             }
-            IconButton(onClick = onSettings) {
-                Icon(Icons.Filled.Settings, contentDescription = "AWS keys")
+            IconButton(onClick = onManageProfiles) {
+                Icon(Icons.Filled.AccountCircle, contentDescription = "Profiles")
             }
         },
     ) { pad ->
         Column(Modifier.padding(pad).fillMaxSize()) {
+            Row(
+                Modifier.fillMaxWidth().padding(horizontal = 8.dp),
+                verticalAlignment = Alignment.CenterVertically,
+            ) {
+                ProfilePicker(session, onManageProfiles)
+                Spacer(Modifier.weight(1f))
+                SelectorButton(region, REGIONS) { session.setRegion(it) }
+            }
             if (loader.loading) LinearProgressIndicator(Modifier.fillMaxWidth())
             loader.error?.let { ErrorCard(it, onRetry = { loader.reload() }) }
             val list = loader.data
             if (list != null && list.isEmpty()) {
-                EmptyState("No EKS clusters in $region. Pick another region above.")
+                EmptyState("No EKS clusters for ${profile?.name ?: "this profile"} in $region. Try another region.")
             }
             LazyColumn(
                 contentPadding = PaddingValues(16.dp),
@@ -179,6 +277,51 @@ fun ClustersScreen(
                     ClusterCard(c) { onOpen(c) }
                 }
             }
+        }
+    }
+}
+
+@Composable
+private fun ProfilePicker(session: Session, onManage: () -> Unit) {
+    var open by remember { mutableStateOf(false) }
+    val active = session.active
+    Box {
+        TextButton(onClick = { open = true }) {
+            Text(
+                active?.name ?: "No profile",
+                style = MaterialTheme.typography.titleSmall,
+                fontWeight = FontWeight.SemiBold,
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis,
+                modifier = Modifier.widthIn(max = 180.dp),
+            )
+            Icon(Icons.Filled.ArrowDropDown, contentDescription = "Switch profile")
+        }
+        DropdownMenu(
+            expanded = open,
+            onDismissRequest = { open = false },
+            modifier = Modifier.heightIn(max = 440.dp),
+        ) {
+            session.state.profiles.forEach { p ->
+                DropdownMenuItem(
+                    text = { Text(p.name) },
+                    trailingIcon = {
+                        if (p.id == active?.id) Icon(Icons.Filled.Check, contentDescription = "Active")
+                    },
+                    onClick = {
+                        session.switchTo(p.id)
+                        open = false
+                    },
+                )
+            }
+            HorizontalDivider()
+            DropdownMenuItem(
+                text = { Text("Manage profiles") },
+                onClick = {
+                    open = false
+                    onManage()
+                },
+            )
         }
     }
 }

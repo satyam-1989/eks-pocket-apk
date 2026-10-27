@@ -6,6 +6,10 @@ plugins {
     id("org.jetbrains.kotlin.plugin.compose")
 }
 
+// Set by the CI workflow from GitHub secrets. When absent, release builds fall back to the
+// throwaway debug key so the build still works.
+val signingKeystore: String? = System.getenv("SIGNING_KEYSTORE_PATH")
+
 android {
     namespace = "dev.ekspocket"
     compileSdk = 36
@@ -14,12 +18,27 @@ android {
         applicationId = "dev.ekspocket"
         minSdk = 36 // Android 16
         targetSdk = 36
-        versionCode = 1
-        versionName = "1.0"
+        versionCode = 2
+        versionName = "1.1"
+    }
+
+    signingConfigs {
+        signingKeystore?.let { path ->
+            create("release") {
+                storeFile = file(path)
+                storePassword = System.getenv("SIGNING_STORE_PASSWORD")
+                keyAlias = System.getenv("SIGNING_KEY_ALIAS")
+                // PKCS12 keystores use the same password for the store and the key.
+                keyPassword = System.getenv("SIGNING_STORE_PASSWORD")
+            }
+        }
     }
 
     buildTypes {
-        release { isMinifyEnabled = false }
+        release {
+            isMinifyEnabled = false
+            signingConfig = signingConfigs.getByName(if (signingKeystore != null) "release" else "debug")
+        }
     }
 
     compileOptions {
