@@ -16,6 +16,7 @@ It signs AWS requests itself with your access key, lists your EKS clusters, and 
   - Access: Roles, RoleBindings, ClusterRoles, ClusterRoleBindings
   - Cluster: nodes
 - Filters every list by name as you type. Plain text matches anywhere in the name (case-insensitive); tap `.*` for regex such as `^api-.*-v2$` or `(worker|cron)`; start with `!` to exclude, like k9s. The namespace picker has the same search.
+- Three views for every list, remembered per kind: a compact one-line list, a detailed list (node, IPs, images, capacity, keys, subjects and more), and a grid of status cards.
 - "Other kinds" lists every resource type the cluster serves, including CRDs such as Argo CD Applications, with search.
 - Streams pod logs live, including the previous container's logs after a crash.
 - Opens an interactive shell inside a container (bash if present, otherwise sh).

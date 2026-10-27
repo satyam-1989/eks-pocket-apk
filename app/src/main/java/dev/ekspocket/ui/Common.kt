@@ -11,12 +11,19 @@ import androidx.compose.foundation.clickable
 import androidx.compose.foundation.isSystemInDarkTheme
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyColumn
+import androidx.compose.foundation.lazy.grid.GridCells
+import androidx.compose.foundation.lazy.grid.GridItemSpan
+import androidx.compose.foundation.lazy.grid.LazyVerticalGrid
+import androidx.compose.foundation.lazy.grid.items
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.ArrowBack
+import androidx.compose.material.icons.automirrored.filled.List
+import androidx.compose.material.icons.filled.Check
+import androidx.compose.material.icons.filled.Menu
 import androidx.compose.material.icons.filled.ArrowDropDown
 import androidx.compose.material.icons.filled.Clear
 import androidx.compose.material.icons.filled.Search
@@ -28,6 +35,9 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.SolidColor
+import androidx.compose.ui.graphics.vector.ImageVector
+import androidx.compose.ui.graphics.vector.path
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
@@ -35,6 +45,8 @@ import androidx.compose.ui.text.input.ImeAction
 import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
+import dev.ekspocket.data.ViewMode
+import dev.ekspocket.data.ViewPrefs
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
@@ -417,41 +429,221 @@ fun StatusPill(text: String) {
     }
 }
 
-/** One row in a resource list. [facts] render as separate quiet labels. */
+// ---------- Resource rows in three views ----------
+
+val LocalViewMode = compositionLocalOf { ViewMode.DETAILED }
+val LocalViewPrefs = staticCompositionLocalOf<ViewPrefs?> { null }
+
+val ViewMode.label: String
+    get() = when (this) {
+        ViewMode.COMPACT -> "Compact list"
+        ViewMode.DETAILED -> "Detailed list"
+        ViewMode.GRID -> "Grid"
+    }
+
+private val GridIcon: ImageVector by lazy {
+    ImageVector.Builder("Grid", 24.dp, 24.dp, 24f, 24f).apply {
+        path(fill = SolidColor(Color.Black)) {
+            for ((x, y) in listOf(3f to 3f, 13f to 3f, 3f to 13f, 13f to 13f)) {
+                moveTo(x, y)
+                horizontalLineToRelative(8f)
+                verticalLineToRelative(8f)
+                horizontalLineToRelative(-8f)
+                close()
+            }
+        }
+    }.build()
+}
+
+fun ViewMode.icon(): ImageVector = when (this) {
+    ViewMode.COMPACT -> Icons.Filled.Menu
+    ViewMode.DETAILED -> Icons.AutoMirrored.Filled.List
+    ViewMode.GRID -> GridIcon
+}
+
+@Composable
+fun ViewModeButton(mode: ViewMode, onChange: (ViewMode) -> Unit) {
+    var open by remember { mutableStateOf(false) }
+    Box {
+        IconButton(onClick = { open = true }) {
+            Icon(mode.icon(), contentDescription = "View: ${mode.label}")
+        }
+        DropdownMenu(expanded = open, onDismissRequest = { open = false }) {
+            ViewMode.entries.forEach { m ->
+                DropdownMenuItem(
+                    text = { Text(m.label) },
+                    leadingIcon = { Icon(m.icon(), contentDescription = null) },
+                    trailingIcon = {
+                        if (m == mode) Icon(Icons.Filled.Check, contentDescription = "Selected")
+                    },
+                    onClick = {
+                        onChange(m)
+                        open = false
+                    },
+                )
+            }
+        }
+    }
+}
+
+/** Filter box plus view switcher for a resource kind. The view is remembered per [kindKey]. */
+@Composable
+fun ListToolbar(
+    kindKey: String,
+    filterText: String,
+    filterRegex: Boolean,
+    filterError: String?,
+    onText: (String) -> Unit,
+    onRegex: (Boolean) -> Unit,
+) {
+    val prefs = LocalViewPrefs.current
+    val mode = prefs?.get(kindKey) ?: ViewMode.DETAILED
+    Row(
+        Modifier.fillMaxWidth().padding(start = 12.dp, end = 4.dp, top = 2.dp, bottom = 2.dp),
+        verticalAlignment = Alignment.CenterVertically,
+    ) {
+        FilterBar(
+            text = filterText,
+            regex = filterRegex,
+            error = filterError,
+            onText = onText,
+            onRegex = onRegex,
+            modifier = Modifier.weight(1f),
+        )
+        ViewModeButton(mode) { prefs?.set(kindKey, it) }
+    }
+}
+
+@Composable
+fun viewModeFor(kindKey: String): ViewMode =
+    LocalViewPrefs.current?.get(kindKey) ?: ViewMode.DETAILED
+
+@Composable
+private fun RowMenu(menu: @Composable (close: () -> Unit) -> Unit) {
+    var open by remember { mutableStateOf(false) }
+    Box {
+        IconButton(onClick = { open = true }) {
+            Icon(Icons.Filled.MoreVert, contentDescription = "Actions")
+        }
+        DropdownMenu(expanded = open, onDismissRequest = { open = false }) {
+            menu { open = false }
+        }
+    }
+}
+
+/**
+ * One resource, drawn according to [LocalViewMode]. [facts] are short labels; [details] are
+ * extra label/value lines shown only in the detailed list.
+ */
 @Composable
 fun ResourceRow(
     title: String,
     facts: List<String>,
     status: String?,
     onClick: (() -> Unit)? = null,
+    details: List<Pair<String, String>> = emptyList(),
     menu: (@Composable (close: () -> Unit) -> Unit)? = null,
+) {
+    when (LocalViewMode.current) {
+        ViewMode.COMPACT -> CompactRow(title, facts, status, onClick, menu)
+        ViewMode.DETAILED -> DetailedRow(title, facts, status, onClick, details, menu)
+        ViewMode.GRID -> GridCard(title, facts, status, onClick, menu)
+    }
+}
+
+@Composable
+private fun statusDotColor(status: String?): Color =
+    if (status != null) statusColor(status) else MaterialTheme.colorScheme.outline
+
+private fun Modifier.clickableIf(onClick: (() -> Unit)?): Modifier =
+    if (onClick != null) this.clickable(onClick = onClick) else this
+
+@Composable
+private fun CompactRow(
+    title: String,
+    facts: List<String>,
+    status: String?,
+    onClick: (() -> Unit)?,
+    menu: (@Composable (close: () -> Unit) -> Unit)?,
+) {
+    val shape = RoundedCornerShape(8.dp)
+    Surface(
+        shape = shape,
+        color = MaterialTheme.colorScheme.surfaceContainer,
+        modifier = Modifier.fillMaxWidth().clip(shape).clickableIf(onClick),
+    ) {
+        Row(
+            Modifier
+                .heightIn(min = 44.dp)
+                .padding(start = 12.dp, end = if (menu != null) 0.dp else 12.dp),
+            verticalAlignment = Alignment.CenterVertically,
+        ) {
+            Box(Modifier.size(8.dp).background(statusDotColor(status), CircleShape))
+            Spacer(Modifier.width(10.dp))
+            Text(
+                title,
+                fontFamily = Mono,
+                style = MaterialTheme.typography.bodyMedium,
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis,
+                modifier = Modifier.weight(1f),
+            )
+            if (status != null) {
+                Text(
+                    status,
+                    style = MaterialTheme.typography.labelSmall,
+                    fontWeight = FontWeight.SemiBold,
+                    color = statusColor(status),
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis,
+                    modifier = Modifier.padding(start = 8.dp).widthIn(max = 120.dp),
+                )
+            }
+            facts.firstOrNull()?.let {
+                Text(
+                    it,
+                    style = MaterialTheme.typography.labelSmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis,
+                    modifier = Modifier.padding(start = 8.dp).widthIn(max = 110.dp),
+                )
+            }
+            if (menu != null) RowMenu(menu)
+        }
+    }
+}
+
+@OptIn(ExperimentalLayoutApi::class)
+@Composable
+private fun DetailedRow(
+    title: String,
+    facts: List<String>,
+    status: String?,
+    onClick: (() -> Unit)?,
+    details: List<Pair<String, String>>,
+    menu: (@Composable (close: () -> Unit) -> Unit)?,
 ) {
     val shape = RoundedCornerShape(10.dp)
     Surface(
         shape = shape,
         color = MaterialTheme.colorScheme.surfaceContainer,
-        modifier = Modifier
-            .fillMaxWidth()
-            .clip(shape)
-            .then(if (onClick != null) Modifier.clickable(onClick = onClick) else Modifier),
+        modifier = Modifier.fillMaxWidth().clip(shape).clickableIf(onClick),
     ) {
-        Row(
-            Modifier.padding(start = 14.dp, top = 12.dp, bottom = 12.dp, end = 2.dp),
-            verticalAlignment = Alignment.CenterVertically,
-        ) {
+        Row(Modifier.padding(start = 14.dp, top = 12.dp, bottom = 12.dp, end = 2.dp)) {
             Column(Modifier.weight(1f)) {
                 Text(
                     title,
                     fontFamily = Mono,
                     style = MaterialTheme.typography.bodyLarge,
                     fontWeight = FontWeight.Medium,
-                    maxLines = 1,
+                    maxLines = 2,
                     overflow = TextOverflow.Ellipsis,
                 )
                 Spacer(Modifier.height(6.dp))
-                Row(
-                    verticalAlignment = Alignment.CenterVertically,
+                FlowRow(
                     horizontalArrangement = Arrangement.spacedBy(12.dp),
+                    verticalArrangement = Arrangement.spacedBy(4.dp),
                 ) {
                     if (status != null) StatusPill(status)
                     facts.forEach {
@@ -459,23 +651,78 @@ fun ResourceRow(
                             it,
                             style = MaterialTheme.typography.labelMedium,
                             color = MaterialTheme.colorScheme.onSurfaceVariant,
-                            maxLines = 1,
                         )
                     }
                 }
-            }
-            if (menu != null) {
-                var open by remember { mutableStateOf(false) }
-                Box {
-                    IconButton(onClick = { open = true }) {
-                        Icon(Icons.Filled.MoreVert, contentDescription = "Actions")
-                    }
-                    DropdownMenu(expanded = open, onDismissRequest = { open = false }) {
-                        menu { open = false }
+                if (details.isNotEmpty()) {
+                    Spacer(Modifier.height(8.dp))
+                    details.forEach { (label, value) ->
+                        Row(Modifier.padding(vertical = 2.dp)) {
+                            Text(
+                                label,
+                                style = MaterialTheme.typography.labelSmall,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                modifier = Modifier.width(84.dp),
+                            )
+                            Text(
+                                value,
+                                fontFamily = Mono,
+                                style = MaterialTheme.typography.bodySmall,
+                                maxLines = 3,
+                                overflow = TextOverflow.Ellipsis,
+                            )
+                        }
                     }
                 }
-            } else {
-                Spacer(Modifier.width(12.dp))
+            }
+            if (menu != null) RowMenu(menu) else Spacer(Modifier.width(12.dp))
+        }
+    }
+}
+
+@Composable
+private fun GridCard(
+    title: String,
+    facts: List<String>,
+    status: String?,
+    onClick: (() -> Unit)?,
+    menu: (@Composable (close: () -> Unit) -> Unit)?,
+) {
+    val shape = RoundedCornerShape(12.dp)
+    Surface(
+        shape = shape,
+        color = MaterialTheme.colorScheme.surfaceContainer,
+        modifier = Modifier.fillMaxWidth().clip(shape).clickableIf(onClick),
+    ) {
+        Column {
+            Box(Modifier.fillMaxWidth().height(4.dp).background(statusDotColor(status)))
+            Row(Modifier.padding(start = 12.dp, top = 8.dp, end = if (menu != null) 0.dp else 12.dp)) {
+                Text(
+                    title,
+                    fontFamily = Mono,
+                    style = MaterialTheme.typography.bodyMedium,
+                    fontWeight = FontWeight.SemiBold,
+                    minLines = 2,
+                    maxLines = 2,
+                    overflow = TextOverflow.Ellipsis,
+                    modifier = Modifier.weight(1f).padding(top = if (menu != null) 4.dp else 0.dp),
+                )
+                if (menu != null) RowMenu(menu)
+            }
+            Column(
+                Modifier.padding(start = 12.dp, end = 12.dp, top = 6.dp, bottom = 12.dp),
+                verticalArrangement = Arrangement.spacedBy(4.dp),
+            ) {
+                if (status != null) StatusPill(status)
+                facts.take(2).forEach {
+                    Text(
+                        it,
+                        style = MaterialTheme.typography.labelSmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        maxLines = 1,
+                        overflow = TextOverflow.Ellipsis,
+                    )
+                }
             }
         }
     }
@@ -490,41 +737,62 @@ fun <T> ResourceList(
     fields: (T) -> List<String?> = { emptyList() },
     row: @Composable (T) -> Unit,
 ) {
+    val mode = LocalViewMode.current
+    val data = loader.data
+    val filtering = data != null && filter != null && filter.active
+    val shown = if (filtering && data != null && filter != null) data.filter { filter.matches(fields(it)) } else data
+    val countText = if (filtering && data != null && data.isNotEmpty()) "${shown?.size ?: 0} of ${data.size} match" else null
+    val emptyMsg = when {
+        data != null && data.isEmpty() -> emptyText
+        shown != null && shown.isEmpty() -> "Nothing matches the filter"
+        else -> null
+    }
+    val err = loader.error
+    val padding = PaddingValues(start = 12.dp, end = 12.dp, top = 8.dp, bottom = 96.dp)
+
     PullToRefreshBox(
         isRefreshing = loader.loading,
         onRefresh = { loader.reload() },
         modifier = Modifier.fillMaxSize(),
     ) {
-        LazyColumn(
-            modifier = Modifier.fillMaxSize(),
-            contentPadding = PaddingValues(start = 12.dp, end = 12.dp, top = 8.dp, bottom = 96.dp),
-            verticalArrangement = Arrangement.spacedBy(8.dp),
-        ) {
-            val err = loader.error
-            if (err != null) item { ErrorCard(err, onRetry = { loader.reload() }) }
-            val data = loader.data
-            val shown = if (data != null && filter != null && filter.active) {
-                data.filter { filter.matches(fields(it)) }
-            } else {
-                data
-            }
-            if (data != null && filter != null && filter.active && data.isNotEmpty()) {
-                item {
-                    Text(
-                        "${shown?.size ?: 0} of ${data.size} match",
-                        style = MaterialTheme.typography.labelMedium,
-                        color = MaterialTheme.colorScheme.onSurfaceVariant,
-                        modifier = Modifier.padding(horizontal = 4.dp),
-                    )
+        if (mode == ViewMode.GRID) {
+            LazyVerticalGrid(
+                columns = GridCells.Adaptive(minSize = 160.dp),
+                modifier = Modifier.fillMaxSize(),
+                contentPadding = padding,
+                verticalArrangement = Arrangement.spacedBy(8.dp),
+                horizontalArrangement = Arrangement.spacedBy(8.dp),
+            ) {
+                if (err != null) {
+                    item(span = { GridItemSpan(maxLineSpan) }) { ErrorCard(err, onRetry = { loader.reload() }) }
                 }
+                if (countText != null) item(span = { GridItemSpan(maxLineSpan) }) { MatchCount(countText) }
+                if (emptyMsg != null) item(span = { GridItemSpan(maxLineSpan) }) { EmptyState(emptyMsg) }
+                items(shown.orEmpty(), key = key) { row(it) }
             }
-            when {
-                data != null && data.isEmpty() -> item { EmptyState(emptyText) }
-                shown != null && shown.isEmpty() -> item { EmptyState("Nothing matches the filter") }
+        } else {
+            LazyColumn(
+                modifier = Modifier.fillMaxSize(),
+                contentPadding = padding,
+                verticalArrangement = Arrangement.spacedBy(if (mode == ViewMode.COMPACT) 4.dp else 8.dp),
+            ) {
+                if (err != null) item { ErrorCard(err, onRetry = { loader.reload() }) }
+                if (countText != null) item { MatchCount(countText) }
+                if (emptyMsg != null) item { EmptyState(emptyMsg) }
+                items(shown.orEmpty(), key = key) { row(it) }
             }
-            items(shown.orEmpty(), key = key) { row(it) }
         }
     }
+}
+
+@Composable
+private fun MatchCount(text: String) {
+    Text(
+        text,
+        style = MaterialTheme.typography.labelMedium,
+        color = MaterialTheme.colorScheme.onSurfaceVariant,
+        modifier = Modifier.padding(horizontal = 4.dp),
+    )
 }
 
 @Composable

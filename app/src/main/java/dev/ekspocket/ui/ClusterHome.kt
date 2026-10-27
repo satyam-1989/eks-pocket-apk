@@ -31,6 +31,9 @@ import dev.ekspocket.data.Session
 import dev.ekspocket.k8s.BUILTIN_KINDS
 import dev.ekspocket.k8s.K8sClient
 import dev.ekspocket.k8s.age
+import dev.ekspocket.k8s.detailsOf
+import dev.ekspocket.k8s.formatMemory
+import dev.ekspocket.k8s.imagesOf
 import dev.ekspocket.k8s.meta
 import dev.ekspocket.k8s.objects
 import dev.ekspocket.k8s.podSummary
@@ -79,20 +82,23 @@ fun ClusterHomeScreen(session: Session, cluster: EksCluster, nav: Nav) {
                 onSelect = { selected = it },
                 onOther = { nav.push(Screen.OtherKinds(ns)) },
             )
-            FilterBar(
-                text = filterText,
-                regex = filterRegex,
-                error = filter.error,
+            val kindKey = "${kind.group}/${kind.plural}"
+            ListToolbar(
+                kindKey = kindKey,
+                filterText = filterText,
+                filterRegex = filterRegex,
+                filterError = filter.error,
                 onText = { filterText = it },
                 onRegex = { filterRegex = it },
-                modifier = Modifier.padding(horizontal = 12.dp),
             )
-            when (kind.plural) {
-                "pods" -> PodsTab(k8s, ns, nav, filter)
-                "deployments" -> DeploymentsTab(k8s, ns, nav, actions, filter)
-                "services" -> ServicesTab(k8s, ns, nav, actions, filter)
-                "nodes" -> NodesTab(k8s, nav, actions, filter)
-                else -> GenericTab(k8s, kind, ns, nav, actions, filter)
+            CompositionLocalProvider(LocalViewMode provides viewModeFor(kindKey)) {
+                when (kind.plural) {
+                    "pods" -> PodsTab(k8s, ns, nav, filter)
+                    "deployments" -> DeploymentsTab(k8s, ns, nav, actions, filter)
+                    "services" -> ServicesTab(k8s, ns, nav, actions, filter)
+                    "nodes" -> NodesTab(k8s, nav, actions, filter)
+                    else -> GenericTab(k8s, kind, ns, nav, actions, filter)
+                }
             }
         }
     }
@@ -263,10 +269,16 @@ private fun PodsTab(k8s: K8sClient, ns: String?, nav: Nav, filter: NameFilter) {
             if (s.restarts > 0) add("${s.restarts} restarts")
             add(age(p.meta("creationTimestamp")))
         }
+        val spec = p.optJSONObject("spec")
         ResourceRow(
             title = p.meta("name"),
             facts = facts,
             status = s.phase,
+            details = detailsOf(
+                "Node" to spec?.optString("nodeName"),
+                "Pod IP" to p.optJSONObject("status")?.optString("podIP"),
+                "Images" to imagesOf(spec),
+            ),
             onClick = { nav.push(Screen.PodDetail(p.meta("namespace"), p.meta("name"))) },
         )
     }
@@ -298,6 +310,10 @@ private fun DeploymentsTab(k8s: K8sClient, ns: String?, nav: Nav, actions: Actio
             title = name,
             facts = listOfNotNull(if (ns == null) dns else null, "$ready/$desired ready", age(d.meta("creationTimestamp"))),
             status = status,
+            details = detailsOf(
+                "Images" to imagesOf(d.optJSONObject("spec")?.optJSONObject("template")?.optJSONObject("spec")),
+                "Strategy" to d.optJSONObject("spec")?.optJSONObject("strategy")?.optString("type"),
+            ),
             onClick = { nav.push(Screen.Yaml("deployment/$name", path, dns)) },
             menu = { close ->
                 DropdownMenuItem(text = { Text("Scale") }, onClick = { close(); scaling = d })
@@ -381,6 +397,13 @@ private fun ServicesTab(k8s: K8sClient, ns: String?, nav: Nav, actions: Actions,
                 ports.ifBlank { null },
             ),
             status = null,
+            details = detailsOf(
+                "Cluster IP" to spec?.optString("clusterIP"),
+                "External" to lb,
+                "Selector" to spec?.optJSONObject("selector")?.let { sel ->
+                    sel.keys().asSequence().joinToString(", ") { "$it=${sel.optString(it)}" }
+                },
+            ),
             onClick = { nav.push(Screen.Yaml("service/$name", path, sns)) },
             menu = { close ->
                 if (!lb.isNullOrBlank()) {
@@ -440,6 +463,15 @@ private fun NodesTab(k8s: K8sClient, nav: Nav, actions: Actions, filter: NameFil
                 age(n.meta("creationTimestamp")),
             ),
             status = status,
+            details = detailsOf(
+                "Zone" to labels?.optString("topology.kubernetes.io/zone"),
+                "Internal IP" to n.optJSONObject("status")?.optJSONArray("addresses").objects()
+                    .firstOrNull { it.optString("type") == "InternalIP" }?.optString("address"),
+                "Capacity" to n.optJSONObject("status")?.optJSONObject("capacity")?.let { cap ->
+                    "${cap.optString("cpu")} CPU, ${formatMemory(cap.optString("memory"))}"
+                },
+                "OS" to n.optJSONObject("status")?.optJSONObject("nodeInfo")?.optString("osImage"),
+            ),
             onClick = { nav.push(Screen.Yaml("node/$name", "/api/v1/nodes/$name", "default")) },
             menu = { close ->
                 DropdownMenuItem(

@@ -18,12 +18,14 @@ import dev.ekspocket.aws.EksCluster
 import dev.ekspocket.data.CredentialStore
 import dev.ekspocket.k8s.Kind
 import dev.ekspocket.data.Session
+import dev.ekspocket.data.ViewPrefs
 import dev.ekspocket.ui.ClusterHomeScreen
 import dev.ekspocket.ui.ClustersScreen
 import dev.ekspocket.ui.EditProfileScreen
 import dev.ekspocket.ui.EksPocketTheme
 import dev.ekspocket.ui.ExecScreen
 import dev.ekspocket.ui.LocalProfileName
+import dev.ekspocket.ui.LocalViewPrefs
 import dev.ekspocket.ui.KindListScreen
 import dev.ekspocket.ui.LogsScreen
 import dev.ekspocket.ui.OtherKindsScreen
@@ -37,9 +39,10 @@ class MainActivity : ComponentActivity() {
         super.onCreate(savedInstanceState)
         enableEdgeToEdge()
         val store = CredentialStore(applicationContext)
+        val viewPrefs = ViewPrefs(applicationContext)
         setContent {
             EksPocketTheme {
-                Surface(color = MaterialTheme.colorScheme.background) { App(store) }
+                Surface(color = MaterialTheme.colorScheme.background) { App(store, viewPrefs) }
             }
         }
     }
@@ -79,7 +82,7 @@ class Nav(private val stack: SnapshotStateList<Screen>) {
 private fun stateKey(index: Int, screen: Screen) = "$index:${screen.hashCode()}"
 
 @Composable
-fun App(store: CredentialStore) {
+fun App(store: CredentialStore, viewPrefs: ViewPrefs) {
     val session = remember { Session(store) }
     val stack = remember {
         mutableStateListOf<Screen>(
@@ -101,7 +104,10 @@ fun App(store: CredentialStore) {
     }
 
     val screen = stack.last()
-    CompositionLocalProvider(LocalProfileName provides session.active?.name) {
+    CompositionLocalProvider(
+        LocalProfileName provides session.active?.name,
+        LocalViewPrefs provides viewPrefs,
+    ) {
         holder.SaveableStateProvider(key = stateKey(stack.lastIndex, screen)) {
             when (screen) {
                 is Screen.EditProfile -> EditProfileScreen(

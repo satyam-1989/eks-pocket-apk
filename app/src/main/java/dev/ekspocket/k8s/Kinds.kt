@@ -52,7 +52,47 @@ val BUILTIN_KINDS = listOf(
     Kind("Node", "nodes", CORE, false, "Nodes", "Cluster"),
 )
 
-data class RowSummary(val status: String?, val facts: List<String>)
+data class RowSummary(
+    val status: String?,
+    val facts: List<String>,
+    val details: List<Pair<String, String>> = emptyList(),
+)
+
+/** Keeps only the label/value pairs that have a non-blank value. */
+fun detailsOf(vararg pairs: Pair<String, String?>): List<Pair<String, String>> =
+    pairs.mapNotNull { (label, value) -> value?.takeIf { it.isNotBlank() }?.let { label to it } }
+
+/** Container images of a pod spec, comma separated. */
+fun imagesOf(podSpec: JSONObject?): String? =
+    podSpec?.optJSONArray("containers").objects()
+        .mapNotNull { it.optString("image").takeIf { img -> img.isNotBlank() } }
+        .joinToString(", ")
+        .ifBlank { null }
+
+/** "16073196Ki" -> "15.3 GiB". Leaves other formats as they are. */
+fun formatMemory(quantity: String): String {
+    val ki = quantity.removeSuffix("Ki").toLongOrNull() ?: return quantity
+    if (!quantity.endsWith("Ki")) return quantity
+    return String.format("%.1f GiB", ki / 1024.0 / 1024.0)
+}
+
+private fun joinShort(items: List<String>, max: Int): String? = when {
+    items.isEmpty() -> null
+    items.size <= max -> items.joinToString(", ")
+    else -> items.take(max).joinToString(", ") + " +${items.size - max}"
+}
+
+private fun keysOf(o: JSONObject, vararg fields: String): String? =
+    joinShort(fields.flatMap { f -> o.optJSONObject(f)?.keys()?.asSequence()?.toList().orEmpty() }.sorted(), 6)
+
+private fun labelDetails(o: JSONObject): List<Pair<String, String>> {
+    val labels = o.obj("metadata", "labels") ?: return emptyList()
+    val pairs = labels.keys().asSequence().map { "$it=${labels.optString(it)}" }.toList()
+    return detailsOf("Labels" to joinShort(pairs, 3))
+}
+
+private fun stringList(arr: org.json.JSONArray?): List<String> =
+    if (arr == null) emptyList() else (0 until arr.length()).map { arr.optString(it) }
 
 private fun JSONObject?.obj(vararg keys: String): JSONObject? {
     var o = this
@@ -89,18 +129,40 @@ fun summarize(kind: Kind, o: JSONObject): RowSummary {
             val ready = status?.optInt("readyReplicas", 0) ?: 0
             val owner = o.optJSONObject("metadata")?.optJSONArray("ownerReferences").objects()
                 .firstOrNull()?.str("name")
-            RowSummary(replicaStatus(ready, desired), listOfNotNull("$ready/$desired ready", owner))
+            RowSummary(
+                replicaStatus(ready, desired),
+                listOfNotNull("$ready/$desired ready", owner),
+                detailsOf(
+                    "Images" to imagesOf(spec.obj("template", "spec")),
+                    "Strategy" to (spec.obj("updateStrategy").str("type") ?: spec.obj("strategy").str("type")),
+                ),
+            )
         }
 
         "apps/daemonsets" -> {
             val desired = status?.optInt("desiredNumberScheduled", 0) ?: 0
             val ready = status?.optInt("numberReady", 0) ?: 0
-            RowSummary(if (ready >= desired) "Available" else "Progressing", listOf("$ready/$desired ready"))
+            RowSummary(
+                if (ready >= desired) "Available" else "Progressing",
+                listOf("$ready/$desired ready"),
+                detailsOf("Images" to imagesOf(spec.obj("template", "spec"))),
+            )
         }
 
         "networking.k8s.io/ingresses" -> {
             val hosts = spec?.optJSONArray("rules").objects().mapNotNull { it.str("host") }
-            RowSummary(null, listOfNotNull(spec.str("ingressClassName"), firstPlus(hosts)))
+            val address = status.obj("loadBalancer")?.optJSONArray("ingress").objects().firstOrNull()
+                ?.let { it.str("hostname") ?: it.str("ip") }
+            val tlsHosts = spec?.optJSONArray("tls").objects().flatMap { stringList(it.optJSONArray("hosts")) }
+            RowSummary(
+                null,
+                listOfNotNull(spec.str("ingressClassName"), firstPlus(hosts)),
+                detailsOf(
+                    "Address" to address,
+                    "Hosts" to if (hosts.size > 1) joinShort(hosts, 5) else null,
+                    "TLS" to joinShort(tlsHosts, 3),
+                ),
+            )
         }
 
         "networking.k8s.io/networkpolicies" -> {
@@ -112,17 +174,28 @@ fun summarize(kind: Kind, o: JSONObject): RowSummary {
             }
             val typesArr = spec?.optJSONArray("policyTypes")
             val types = if (typesArr == null) null else (0 until typesArr.length()).joinToString("/") { typesArr.optString(it) }
-            RowSummary(null, listOfNotNull(selector, types?.ifBlank { null }))
+            RowSummary(
+                null,
+                listOfNotNull(selector, types?.ifBlank { null }),
+                detailsOf(
+                    "Ingress rules" to spec?.optJSONArray("ingress")?.length()?.toString(),
+                    "Egress rules" to spec?.optJSONArray("egress")?.length()?.toString(),
+                ),
+            )
         }
 
-        "core/configmaps" -> RowSummary(null, listOf(keyCount(o, "data", "binaryData")))
+        "core/configmaps" -> RowSummary(
+            null,
+            listOf(keyCount(o, "data", "binaryData")),
+            detailsOf("Keys" to keysOf(o, "data", "binaryData")),
+        )
 
         "core/secrets" -> {
             val type = o.optString("type")
                 .removePrefix("kubernetes.io/")
                 .removePrefix("helm.sh/")
                 .ifBlank { "Opaque" }
-            RowSummary(null, listOf(type, keyCount(o, "data")))
+            RowSummary(null, listOf(type, keyCount(o, "data")), detailsOf("Keys" to keysOf(o, "data")))
         }
 
         "core/persistentvolumeclaims" -> RowSummary(
@@ -131,6 +204,10 @@ fun summarize(kind: Kind, o: JSONObject): RowSummary {
                 status.obj("capacity").str("storage") ?: spec.obj("resources", "requests").str("storage"),
                 spec.str("storageClassName"),
             ),
+            detailsOf(
+                "Volume" to spec.str("volumeName"),
+                "Access" to joinShort(stringList(spec?.optJSONArray("accessModes")), 3),
+            ),
         )
 
         "core/persistentvolumes" -> {
@@ -138,6 +215,10 @@ fun summarize(kind: Kind, o: JSONObject): RowSummary {
             RowSummary(
                 status.str("phase"),
                 listOfNotNull(spec.obj("capacity").str("storage"), claim, spec.str("persistentVolumeReclaimPolicy")),
+                detailsOf(
+                    "Class" to spec.str("storageClassName"),
+                    "Access" to joinShort(stringList(spec?.optJSONArray("accessModes")), 3),
+                ),
             )
         }
 
@@ -147,19 +228,34 @@ fun summarize(kind: Kind, o: JSONObject): RowSummary {
             RowSummary(
                 null,
                 listOfNotNull(if (isDefault) "default" else null, o.str("provisioner"), o.str("reclaimPolicy")),
+                detailsOf(
+                    "Binding" to o.str("volumeBindingMode"),
+                    "Expansion" to if (o.optBoolean("allowVolumeExpansion")) "allowed" else null,
+                ),
             )
         }
 
         "rbac.authorization.k8s.io/roles", "rbac.authorization.k8s.io/clusterroles" -> {
             val n = o.optJSONArray("rules")?.length() ?: 0
             val aggregated = o.has("aggregationRule")
-            RowSummary(null, listOfNotNull(if (n == 1) "1 rule" else "$n rules", if (aggregated) "aggregated" else null))
+            val resources = o.optJSONArray("rules").objects()
+                .flatMap { stringList(it.optJSONArray("resources")) }
+                .distinct()
+            RowSummary(
+                null,
+                listOfNotNull(if (n == 1) "1 rule" else "$n rules", if (aggregated) "aggregated" else null),
+                detailsOf("Resources" to joinShort(resources, 6)),
+            )
         }
 
         "rbac.authorization.k8s.io/rolebindings", "rbac.authorization.k8s.io/clusterrolebindings" -> {
             val ref = o.optJSONObject("roleRef")?.let { "${it.optString("kind")}/${it.optString("name")}" }
             val subjects = o.optJSONArray("subjects").objects().map { "${it.optString("kind")}:${it.optString("name")}" }
-            RowSummary(null, listOfNotNull(ref, firstPlus(subjects)))
+            RowSummary(
+                null,
+                listOfNotNull(ref, firstPlus(subjects)),
+                detailsOf("Subjects" to if (subjects.size > 1) joinShort(subjects, 5) else null),
+            )
         }
 
         else -> {
@@ -170,7 +266,7 @@ fun summarize(kind: Kind, o: JSONObject): RowSummary {
                 .firstOrNull { it.optString("type") == "Ready" }
                 ?.let { if (it.optString("status") == "True") "Ready" else "NotReady" }
             val sync = status.obj("sync").str("status")
-            RowSummary(health ?: phase ?: ready, listOfNotNull(sync))
+            RowSummary(health ?: phase ?: ready, listOfNotNull(sync), labelDetails(o))
         }
     }
 }

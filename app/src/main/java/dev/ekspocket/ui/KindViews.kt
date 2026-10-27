@@ -74,6 +74,7 @@ fun GenericTab(k8s: K8sClient, kind: Kind, ns: String?, nav: Nav, actions: Actio
             title = name,
             facts = facts,
             status = summary.status,
+            details = summary.details,
             onClick = open,
             menu = { close ->
                 if (kind.scalable) {
@@ -165,15 +166,18 @@ fun KindListScreen(session: Session, kind: Kind, initialNs: String?, nav: Nav) {
         },
     ) { pad ->
         Column(Modifier.padding(pad).fillMaxSize()) {
-            FilterBar(
-                text = filterText,
-                regex = filterRegex,
-                error = filter.error,
+            val kindKey = "${kind.group}/${kind.plural}"
+            ListToolbar(
+                kindKey = kindKey,
+                filterText = filterText,
+                filterRegex = filterRegex,
+                filterError = filter.error,
                 onText = { filterText = it },
                 onRegex = { filterRegex = it },
-                modifier = Modifier.padding(horizontal = 12.dp, vertical = 4.dp),
             )
-            GenericTab(k8s, kind, ns, nav, actions, filter)
+            CompositionLocalProvider(LocalViewMode provides viewModeFor(kindKey)) {
+                GenericTab(k8s, kind, ns, nav, actions, filter)
+            }
         }
     }
 }
