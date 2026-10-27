@@ -1,0 +1,4 @@
+<resources>
+    <color name="ic_launcher_background">#0F1B2A</color>
+    <style name="Theme.EksPocket" parent="android:Theme.Material.NoActionBar" />
+</resources>
