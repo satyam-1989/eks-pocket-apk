@@ -284,15 +284,19 @@ class Session(private val store: CredentialStore, private val appContext: Contex
 
     fun connect(cluster: Cluster): K8sClient {
         val p = active ?: error("No profile selected")
-        val provider: () -> String = if (p.isAws) {
-            val creds = p.credentials()
-            val region = p.region
-            { EksToken.generate(creds, region, cluster.name) }
-        } else {
-            val source = tokenSource(p)
-            { source.token() }
-        }
+        val provider = if (p.isAws) awsTokenProvider(p, cluster.name) else googleTokenProvider(p)
         return K8sClient(cluster, provider).also { k8s = it }
+    }
+
+    private fun awsTokenProvider(p: Profile, clusterName: String): () -> String {
+        val creds = p.credentials()
+        val region = p.region
+        return { EksToken.generate(creds, region, clusterName) }
+    }
+
+    private fun googleTokenProvider(p: Profile): () -> String {
+        val source = tokenSource(p)
+        return { source.token() }
     }
 }
 
