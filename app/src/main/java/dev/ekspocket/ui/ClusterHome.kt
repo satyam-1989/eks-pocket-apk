@@ -26,7 +26,7 @@ import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import dev.ekspocket.Nav
 import dev.ekspocket.Screen
-import dev.ekspocket.aws.EksCluster
+import dev.ekspocket.cloud.Cluster
 import dev.ekspocket.data.Session
 import dev.ekspocket.k8s.BUILTIN_KINDS
 import dev.ekspocket.k8s.K8sClient
@@ -40,7 +40,7 @@ import dev.ekspocket.k8s.podSummary
 import org.json.JSONObject
 
 @Composable
-fun ClusterHomeScreen(session: Session, cluster: EksCluster, nav: Nav) {
+fun ClusterHomeScreen(session: Session, cluster: Cluster, nav: Nav) {
     val connection = remember(cluster) { runCatching { session.connect(cluster) } }
     val k8s = connection.getOrNull()
     if (k8s == null) {
@@ -52,7 +52,15 @@ fun ClusterHomeScreen(session: Session, cluster: EksCluster, nav: Nav) {
         return
     }
 
-    var ns by rememberSaveable { mutableStateOf<String?>("default") }
+    val uiPrefs = LocalViewPrefs.current
+    var ns by rememberSaveable {
+        mutableStateOf<String?>(if (uiPrefs != null) uiPrefs.lastNamespace(cluster.id) else "default")
+    }
+    val chooseNs: (String?) -> Unit = {
+        ns = it
+        uiPrefs?.setLastNamespace(cluster.id, it)
+    }
+    var podsByRestarts by rememberSaveable { mutableStateOf(false) }
     var selected by rememberSaveable { mutableStateOf("pods") }
     val kind = BUILTIN_KINDS.firstOrNull { it.plural == selected } ?: BUILTIN_KINDS.first()
     var filterText by rememberSaveable { mutableStateOf("") }
@@ -64,10 +72,10 @@ fun ClusterHomeScreen(session: Session, cluster: EksCluster, nav: Nav) {
 
     AppScaffold(
         title = cluster.name,
-        subtitle = "Kubernetes ${cluster.version}, ${session.region}",
+        subtitle = "${cluster.provider} ${cluster.version}, ${cluster.location}",
         onBack = { nav.pop() },
         snackbar = snackbar,
-        actions = { NamespacePicker(ns, nsLoader.data) { ns = it } },
+        actions = { NamespacePicker(ns, nsLoader.data, chooseNs) },
         fab = {
             ExtendedFloatingActionButton(
                 onClick = { nav.push(Screen.Yaml("Apply YAML", null, ns ?: "default")) },
@@ -90,10 +98,26 @@ fun ClusterHomeScreen(session: Session, cluster: EksCluster, nav: Nav) {
                 filterError = filter.error,
                 onText = { filterText = it },
                 onRegex = { filterRegex = it },
+                extraMenu = if (kind.plural == "pods") {
+                    { close ->
+                        DropdownMenuItem(
+                            text = { Text("Sort by name") },
+                            trailingIcon = { if (!podsByRestarts) Icon(Icons.Filled.Check, contentDescription = "Selected") },
+                            onClick = { podsByRestarts = false; close() },
+                        )
+                        DropdownMenuItem(
+                            text = { Text("Most restarts first") },
+                            trailingIcon = { if (podsByRestarts) Icon(Icons.Filled.Check, contentDescription = "Selected") },
+                            onClick = { podsByRestarts = true; close() },
+                        )
+                    }
+                } else {
+                    null
+                },
             )
             CompositionLocalProvider(LocalViewMode provides viewModeFor(kindKey)) {
                 when (kind.plural) {
-                    "pods" -> PodsTab(k8s, ns, nav, filter)
+                    "pods" -> PodsTab(k8s, ns, nav, filter, podsByRestarts)
                     "deployments" -> DeploymentsTab(k8s, ns, nav, actions, filter)
                     "services" -> ServicesTab(k8s, ns, nav, actions, filter)
                     "nodes" -> NodesTab(k8s, nav, actions, filter)
@@ -254,19 +278,22 @@ private fun NamespaceRow(label: String, selected: Boolean, mono: Boolean, onClic
 }
 
 @Composable
-private fun PodsTab(k8s: K8sClient, ns: String?, nav: Nav, filter: NameFilter) {
+private fun PodsTab(k8s: K8sClient, ns: String?, nav: Nav, filter: NameFilter, byRestarts: Boolean) {
     val loader = rememberLoader(k8s, ns) { k8s.pods(ns).sortedBy { it.meta("name") } }
+    val restartSort = remember {
+        compareByDescending<JSONObject> { podSummary(it).restarts }.thenBy { it.meta("name") }
+    }
     ResourceList(
         loader, "No pods here",
         key = { "${it.meta("namespace")}/${it.meta("name")}" },
         filter = filter,
         fields = { listOf(it.meta("name"), if (ns == null) it.meta("namespace") else null) },
+        sort = if (byRestarts) restartSort else null,
     ) { p ->
         val s = podSummary(p)
         val facts = buildList {
             if (ns == null) add(p.meta("namespace"))
             add("${s.ready} ready")
-            if (s.restarts > 0) add("${s.restarts} restarts")
             add(age(p.meta("creationTimestamp")))
         }
         val spec = p.optJSONObject("spec")
@@ -274,7 +301,9 @@ private fun PodsTab(k8s: K8sClient, ns: String?, nav: Nav, filter: NameFilter) {
             title = p.meta("name"),
             facts = facts,
             status = s.phase,
+            badge = { RestartBadge(s.restarts) },
             details = detailsOf(
+                "Last restart" to s.lastRestart,
                 "Node" to spec?.optString("nodeName"),
                 "Pod IP" to p.optJSONObject("status")?.optString("podIP"),
                 "Images" to imagesOf(spec),

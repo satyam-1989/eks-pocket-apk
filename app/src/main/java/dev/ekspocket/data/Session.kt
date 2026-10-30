@@ -9,8 +9,12 @@ import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.setValue
 import dev.ekspocket.aws.AwsCredentials
 import dev.ekspocket.aws.EksClient
-import dev.ekspocket.aws.EksCluster
+import dev.ekspocket.cloud.Cluster
 import dev.ekspocket.aws.EksToken
+import dev.ekspocket.cloud.GkeClient
+import dev.ekspocket.cloud.GoogleAccountTokenSource
+import dev.ekspocket.cloud.ServiceAccountTokenSource
+import dev.ekspocket.cloud.TokenSource
 import dev.ekspocket.k8s.K8sClient
 import okhttp3.OkHttpClient
 import org.json.JSONArray
@@ -23,14 +27,36 @@ import javax.crypto.KeyGenerator
 import javax.crypto.SecretKey
 import javax.crypto.spec.GCMParameterSpec
 
+enum class ProfileType(val label: String) {
+    AWS("AWS"),
+    GCP_KEY("GCP service account"),
+    GCP_ACCOUNT("Google account"),
+}
+
 data class Profile(
     val id: String,
     val name: String,
-    val accessKeyId: String,
-    val secretAccessKey: String,
-    val sessionToken: String?,
-    val region: String,
+    val type: ProfileType = ProfileType.AWS,
+    // AWS
+    val accessKeyId: String = "",
+    val secretAccessKey: String = "",
+    val sessionToken: String? = null,
+    val region: String = "us-east-1",
+    // GCP
+    val projectId: String = "",
+    val gcpKeyJson: String? = null,
+    val googleEmail: String? = null,
 ) {
+    val isAws: Boolean get() = type == ProfileType.AWS
+
+    /** Who this profile acts as, for display. */
+    val identity: String
+        get() = when (type) {
+            ProfileType.AWS -> maskedKey
+            ProfileType.GCP_KEY -> gcpKeyJson?.let { runCatching { JSONObject(it).optString("client_email") }.getOrNull() }.orEmpty()
+            ProfileType.GCP_ACCOUNT -> googleEmail.orEmpty()
+        }
+
     fun credentials() = AwsCredentials(
         accessKeyId, secretAccessKey, sessionToken?.takeIf { it.isNotBlank() },
     )
@@ -79,10 +105,14 @@ class CredentialStore(context: Context) {
                 JSONObject()
                     .put("id", p.id)
                     .put("name", p.name)
+                    .put("type", p.type.name)
                     .put("ak", p.accessKeyId)
                     .put("sk", p.secretAccessKey)
                     .put("st", p.sessionToken ?: "")
                     .put("region", p.region)
+                    .put("project", p.projectId)
+                    .put("gcpKey", p.gcpKeyJson ?: "")
+                    .put("gEmail", p.googleEmail ?: "")
             )
         }
         val json = JSONObject()
@@ -123,10 +153,14 @@ class CredentialStore(context: Context) {
             Profile(
                 id = p.getString("id"),
                 name = p.getString("name"),
-                accessKeyId = p.getString("ak"),
-                secretAccessKey = p.getString("sk"),
+                type = ProfileType.entries.firstOrNull { it.name == p.optString("type") } ?: ProfileType.AWS,
+                accessKeyId = p.optString("ak"),
+                secretAccessKey = p.optString("sk"),
                 sessionToken = p.optString("st").ifBlank { null },
                 region = p.optString("region", "us-east-1"),
+                projectId = p.optString("project"),
+                gcpKeyJson = p.optString("gcpKey").ifBlank { null },
+                googleEmail = p.optString("gEmail").ifBlank { null },
             )
         }
         return ProfileState(profiles, o.optString("active").ifBlank { null })
@@ -161,7 +195,7 @@ class CredentialStore(context: Context) {
     }
 }
 
-class Session(private val store: CredentialStore) {
+class Session(private val store: CredentialStore, private val appContext: Context) {
     var state by mutableStateOf(store.load())
         private set
 
@@ -219,17 +253,46 @@ class Session(private val store: CredentialStore) {
         }))
     }
 
-    fun eks(): EksClient {
-        val p = active ?: error("No AWS profile selected")
-        return EksClient(p.credentials(), p.region, http)
+    private val tokenSources = HashMap<Profile, TokenSource>()
+
+    /** One token source per profile version, so cached Google tokens are reused. */
+    private fun tokenSource(p: Profile): TokenSource = synchronized(tokenSources) {
+        tokenSources.getOrPut(p) {
+            when (p.type) {
+                ProfileType.GCP_KEY -> ServiceAccountTokenSource(
+                    p.gcpKeyJson ?: error("This profile has no service account key"), http,
+                )
+                ProfileType.GCP_ACCOUNT -> GoogleAccountTokenSource(appContext, p.googleEmail)
+                ProfileType.AWS -> error("AWS profiles don't use Google tokens")
+            }
+        }
     }
 
-    fun connect(cluster: EksCluster): K8sClient {
-        val p = active ?: error("No AWS profile selected")
-        val creds = p.credentials()
-        val region = p.region
-        return K8sClient(cluster) { EksToken.generate(creds, region, cluster.name) }
-            .also { k8s = it }
+    fun listClusters(): List<Cluster> {
+        val p = active ?: error("No profile selected")
+        return when (p.type) {
+            ProfileType.AWS -> {
+                val eks = EksClient(p.credentials(), p.region, http)
+                eks.listClusters().map { eks.describeCluster(it) }
+            }
+            ProfileType.GCP_KEY, ProfileType.GCP_ACCOUNT -> {
+                if (p.projectId.isBlank()) error("Set a GCP project ID on this profile")
+                GkeClient(tokenSource(p), p.projectId, http).listClusters()
+            }
+        }
+    }
+
+    fun connect(cluster: Cluster): K8sClient {
+        val p = active ?: error("No profile selected")
+        val provider: () -> String = if (p.isAws) {
+            val creds = p.credentials()
+            val region = p.region
+            { EksToken.generate(creds, region, cluster.name) }
+        } else {
+            val source = tokenSource(p)
+            { source.token() }
+        }
+        return K8sClient(cluster, provider).also { k8s = it }
     }
 }
 

@@ -1,6 +1,6 @@
 package dev.ekspocket.k8s
 
-import dev.ekspocket.aws.EksCluster
+import dev.ekspocket.cloud.Cluster
 import okhttp3.Call
 import okhttp3.MediaType.Companion.toMediaType
 import okhttp3.OkHttpClient
@@ -27,7 +27,7 @@ import javax.net.ssl.X509TrustManager
 class K8sException(val code: Int, message: String) : Exception(message)
 
 class K8sClient(
-    val cluster: EksCluster,
+    val cluster: Cluster,
     private val tokenProvider: () -> String,
 ) {
     private val base = cluster.endpoint.trimEnd('/')
@@ -39,7 +39,7 @@ class K8sClient(
     private val streamHttp: OkHttpClient
 
     init {
-        val tm = trustManagerFor(cluster.caData)
+        val tm = if (cluster.caData.isBlank()) systemTrustManager() else trustManagerFor(cluster.caData)
         val ssl = SSLContext.getInstance("TLS").apply { init(null, arrayOf(tm), null) }
         http = OkHttpClient.Builder()
             .sslSocketFactory(ssl.socketFactory, tm)
@@ -71,6 +71,12 @@ class K8sClient(
         return token!!
     }
 
+    private fun systemTrustManager(): X509TrustManager {
+        val tmf = TrustManagerFactory.getInstance(TrustManagerFactory.getDefaultAlgorithm())
+        tmf.init(null as KeyStore?)
+        return tmf.trustManagers.filterIsInstance<X509TrustManager>().first()
+    }
+
     private fun trustManagerFor(caData: String): X509TrustManager {
         val pem = Base64.getMimeDecoder().decode(caData.trim())
         val certs = CertificateFactory.getInstance("X.509")
@@ -88,7 +94,11 @@ class K8sClient(
         val msg = runCatching { JSONObject(text).optString("message") }.getOrNull()
             .orEmpty().ifBlank { text.take(300) }
         return when (code) {
-            401 -> "The cluster rejected your credentials. Give this IAM identity an EKS access entry (or an aws-auth mapping) on the cluster."
+            401 -> if (cluster.provider == "GKE") {
+                "The cluster rejected your credentials. Give this Google identity Kubernetes Engine access, for example roles/container.developer, or an RBAC binding."
+            } else {
+                "The cluster rejected your credentials. Give this IAM identity an EKS access entry (or an aws-auth mapping) on the cluster."
+            }
             403 -> "Not allowed: $msg"
             else -> "Error $code: $msg"
         }

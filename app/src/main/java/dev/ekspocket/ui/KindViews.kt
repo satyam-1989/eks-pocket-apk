@@ -141,6 +141,7 @@ fun GenericTab(k8s: K8sClient, kind: Kind, ns: String?, nav: Nav, actions: Actio
 @Composable
 fun KindListScreen(session: Session, kind: Kind, initialNs: String?, nav: Nav) {
     val k8s = session.k8s ?: return
+    val uiPrefs = LocalViewPrefs.current
     var ns by rememberSaveable { mutableStateOf(initialNs) }
     val nsLoader = rememberLoader(k8s) { k8s.namespaces() }
     val snackbar = remember { SnackbarHostState() }
@@ -155,7 +156,12 @@ fun KindListScreen(session: Session, kind: Kind, initialNs: String?, nav: Nav) {
         onBack = { nav.pop() },
         snackbar = snackbar,
         actions = {
-            if (kind.namespaced) NamespacePicker(ns, nsLoader.data) { ns = it }
+            if (kind.namespaced) {
+                NamespacePicker(ns, nsLoader.data) {
+                    ns = it
+                    uiPrefs?.setLastNamespace(k8s.cluster.id, it)
+                }
+            }
         },
         fab = {
             ExtendedFloatingActionButton(

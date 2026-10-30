@@ -18,8 +18,8 @@ android {
         applicationId = "dev.ekspocket"
         minSdk = 36 // Android 16
         targetSdk = 36
-        versionCode = 4
-        versionName = "1.3"
+        versionCode = 5
+        versionName = "1.4"
     }
 
     signingConfigs {
@@ -72,5 +72,6 @@ dependencies {
     implementation("org.jetbrains.kotlinx:kotlinx-coroutines-android:1.10.2")
 
     implementation("com.squareup.okhttp3:okhttp:4.12.0")
+    implementation("com.google.android.gms:play-services-auth:21.3.0")
     implementation("org.snakeyaml:snakeyaml-engine:2.9")
 }

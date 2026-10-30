@@ -1,22 +1,12 @@
 package dev.ekspocket.aws
 
+import dev.ekspocket.cloud.Cluster
 import okhttp3.OkHttpClient
 import okhttp3.Request
 import org.json.JSONObject
 import java.util.Base64
 
 class AwsException(message: String) : Exception(message)
-
-data class EksCluster(
-    val name: String,
-    val arn: String,
-    val endpoint: String,
-    val caData: String,
-    val status: String,
-    val version: String,
-    val publicAccess: Boolean,
-    val privateAccess: Boolean,
-)
 
 class EksClient(
     private val creds: AwsCredentials,
@@ -61,12 +51,14 @@ class EksClient(
         return out
     }
 
-    fun describeCluster(name: String): EksCluster {
+    fun describeCluster(name: String): Cluster {
         val c = get("/clusters/$name").getJSONObject("cluster")
         val vpc = c.optJSONObject("resourcesVpcConfig")
-        return EksCluster(
+        return Cluster(
+            id = c.optString("arn").ifBlank { "eks/$region/$name" },
             name = c.getString("name"),
-            arn = c.optString("arn"),
+            provider = "EKS",
+            location = region,
             endpoint = c.optString("endpoint"),
             caData = c.optJSONObject("certificateAuthority")?.optString("data").orEmpty(),
             status = c.optString("status"),

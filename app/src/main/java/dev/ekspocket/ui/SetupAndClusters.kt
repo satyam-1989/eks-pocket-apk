@@ -2,6 +2,10 @@
 
 package dev.ekspocket.ui
 
+import android.app.Activity
+import androidx.activity.compose.rememberLauncherForActivityResult
+import androidx.activity.result.IntentSenderRequest
+import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyColumn
@@ -22,14 +26,23 @@ import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
+import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.text.input.PasswordVisualTransformation
 import androidx.compose.ui.text.input.VisualTransformation
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
-import dev.ekspocket.aws.EksCluster
+import dev.ekspocket.cloud.Cluster
+import dev.ekspocket.cloud.GoogleAuth
+import dev.ekspocket.cloud.ServiceAccountTokenSource
 import dev.ekspocket.data.Profile
+import dev.ekspocket.data.ProfileType
+import dev.ekspocket.k8s.detailsOf
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
+import okhttp3.OkHttpClient
 import dev.ekspocket.data.REGIONS
 import dev.ekspocket.data.Session
 
@@ -45,19 +58,33 @@ fun EditProfileScreen(
     onSave: (Profile) -> Unit,
 ) {
     var name by rememberSaveable { mutableStateOf(existing?.name ?: if (isFirst) "default" else "") }
+    var type by rememberSaveable { mutableStateOf(existing?.type ?: ProfileType.AWS) }
+    // AWS
     var accessKey by rememberSaveable { mutableStateOf(existing?.accessKeyId.orEmpty()) }
     var secretKey by rememberSaveable { mutableStateOf(existing?.secretAccessKey.orEmpty()) }
     var sessionToken by rememberSaveable { mutableStateOf(existing?.sessionToken.orEmpty()) }
     var region by rememberSaveable { mutableStateOf(existing?.region ?: "us-east-1") }
     var showSecret by remember { mutableStateOf(false) }
+    // GCP
+    var projectId by rememberSaveable { mutableStateOf(existing?.projectId.orEmpty()) }
+    var keyJson by rememberSaveable { mutableStateOf(existing?.gcpKeyJson.orEmpty()) }
+    var googleEmail by rememberSaveable { mutableStateOf(existing?.googleEmail.orEmpty()) }
+    var signedInEmail by rememberSaveable { mutableStateOf(existing?.googleEmail) }
 
+    val keyInfo = remember(keyJson) {
+        if (keyJson.isBlank()) null else runCatching { ServiceAccountTokenSource.inspect(keyJson) }
+    }
     val nameError = if (name.isNotBlank() && nameTaken(name)) "Another profile already uses this name" else null
-    val canSave = name.isNotBlank() && nameError == null && accessKey.isNotBlank() && secretKey.isNotBlank()
+    val canSave = name.isNotBlank() && nameError == null && when (type) {
+        ProfileType.AWS -> accessKey.isNotBlank() && secretKey.isNotBlank()
+        ProfileType.GCP_KEY -> keyInfo?.isSuccess == true && projectId.isNotBlank()
+        ProfileType.GCP_ACCOUNT -> signedInEmail != null && projectId.isNotBlank()
+    }
     val keyboard = KeyboardOptions(autoCorrectEnabled = false, keyboardType = KeyboardType.Password)
 
     AppScaffold(
         title = when {
-            isFirst -> "Connect to AWS"
+            isFirst -> "Add your first profile"
             existing == null -> "Add profile"
             else -> "Edit ${existing.name}"
         },
@@ -71,11 +98,16 @@ fun EditProfileScreen(
                 .padding(horizontal = 20.dp, vertical = 8.dp),
             verticalArrangement = Arrangement.spacedBy(14.dp),
         ) {
-            Text(
-                "Keys are encrypted with the Android Keystore and only used to sign requests to AWS.",
-                style = MaterialTheme.typography.bodyMedium,
-                color = MaterialTheme.colorScheme.onSurfaceVariant,
-            )
+            SingleChoiceSegmentedButtonRow(Modifier.fillMaxWidth()) {
+                val options = listOf(ProfileType.AWS to "AWS", ProfileType.GCP_KEY to "GCP key", ProfileType.GCP_ACCOUNT to "Google")
+                options.forEachIndexed { i, (t, label) ->
+                    SegmentedButton(
+                        selected = type == t,
+                        onClick = { type = t },
+                        shape = SegmentedButtonDefaults.itemShape(i, options.size),
+                    ) { Text(label, maxLines = 1) }
+                }
+            }
             OutlinedTextField(
                 value = name,
                 onValueChange = { name = it.take(40) },
@@ -83,55 +115,102 @@ fun EditProfileScreen(
                 placeholder = { Text("prod, staging, client-a") },
                 singleLine = true,
                 isError = nameError != null,
-                supportingText = { if (nameError != null) Text(nameError) },
-                modifier = Modifier.fillMaxWidth(),
-            )
-            OutlinedTextField(
-                value = accessKey,
-                onValueChange = { accessKey = it.trim() },
-                label = { Text("Access key ID") },
-                singleLine = true,
-                keyboardOptions = keyboard.copy(keyboardType = KeyboardType.Ascii),
-                modifier = Modifier.fillMaxWidth(),
-            )
-            OutlinedTextField(
-                value = secretKey,
-                onValueChange = { secretKey = it.trim() },
-                label = { Text("Secret access key") },
-                singleLine = true,
-                visualTransformation = if (showSecret) VisualTransformation.None else PasswordVisualTransformation(),
-                trailingIcon = {
-                    TextButton(onClick = { showSecret = !showSecret }) {
-                        Text(if (showSecret) "Hide" else "Show")
-                    }
+                supportingText = if (nameError != null) {
+                    { Text(nameError) }
+                } else {
+                    null
                 },
-                keyboardOptions = keyboard,
                 modifier = Modifier.fillMaxWidth(),
             )
-            OutlinedTextField(
-                value = sessionToken,
-                onValueChange = { sessionToken = it.trim() },
-                label = { Text("Session token (only for temporary keys)") },
-                singleLine = true,
-                visualTransformation = PasswordVisualTransformation(),
-                keyboardOptions = keyboard,
-                modifier = Modifier.fillMaxWidth(),
-            )
-            Row(verticalAlignment = Alignment.CenterVertically) {
-                Text("Region", style = MaterialTheme.typography.bodyLarge, modifier = Modifier.weight(1f))
-                SelectorButton(region, REGIONS) { region = it }
+
+            when (type) {
+                ProfileType.AWS -> {
+                    OutlinedTextField(
+                        value = accessKey,
+                        onValueChange = { accessKey = it.trim() },
+                        label = { Text("Access key ID") },
+                        singleLine = true,
+                        keyboardOptions = keyboard.copy(keyboardType = KeyboardType.Ascii),
+                        modifier = Modifier.fillMaxWidth(),
+                    )
+                    OutlinedTextField(
+                        value = secretKey,
+                        onValueChange = { secretKey = it.trim() },
+                        label = { Text("Secret access key") },
+                        singleLine = true,
+                        visualTransformation = if (showSecret) VisualTransformation.None else PasswordVisualTransformation(),
+                        trailingIcon = {
+                            TextButton(onClick = { showSecret = !showSecret }) {
+                                Text(if (showSecret) "Hide" else "Show")
+                            }
+                        },
+                        keyboardOptions = keyboard,
+                        modifier = Modifier.fillMaxWidth(),
+                    )
+                    OutlinedTextField(
+                        value = sessionToken,
+                        onValueChange = { sessionToken = it.trim() },
+                        label = { Text("Session token (only for temporary keys)") },
+                        singleLine = true,
+                        visualTransformation = PasswordVisualTransformation(),
+                        keyboardOptions = keyboard,
+                        modifier = Modifier.fillMaxWidth(),
+                    )
+                    Row(verticalAlignment = Alignment.CenterVertically) {
+                        Text("Region", style = MaterialTheme.typography.bodyLarge, modifier = Modifier.weight(1f))
+                        SelectorButton(region, REGIONS) { region = it }
+                    }
+                }
+
+                ProfileType.GCP_KEY -> ServiceAccountKeyInput(
+                    keyJson = keyJson,
+                    keyInfo = keyInfo,
+                    onKey = { json ->
+                        keyJson = json
+                        val info = runCatching { ServiceAccountTokenSource.inspect(json) }.getOrNull()
+                        if (info != null && projectId.isBlank()) projectId = info.second
+                    },
+                )
+
+                ProfileType.GCP_ACCOUNT -> GoogleSignInInput(
+                    requestedEmail = googleEmail,
+                    onRequestedEmail = { googleEmail = it.trim() },
+                    signedInEmail = signedInEmail,
+                    onSignedIn = { signedInEmail = it },
+                )
             }
+
+            if (type != ProfileType.AWS) {
+                OutlinedTextField(
+                    value = projectId,
+                    onValueChange = { projectId = it.trim() },
+                    label = { Text("GCP project ID") },
+                    supportingText = { Text("Clusters in all regions and zones of this project are listed.") },
+                    singleLine = true,
+                    keyboardOptions = KeyboardOptions(autoCorrectEnabled = false, keyboardType = KeyboardType.Ascii),
+                    modifier = Modifier.fillMaxWidth(),
+                )
+            }
+
             Button(
                 onClick = {
+                    val id = existing?.id ?: Profile.newId()
                     onSave(
-                        Profile(
-                            id = existing?.id ?: Profile.newId(),
-                            name = name.trim(),
-                            accessKeyId = accessKey,
-                            secretAccessKey = secretKey,
-                            sessionToken = sessionToken.ifBlank { null },
-                            region = region,
-                        )
+                        when (type) {
+                            ProfileType.AWS -> Profile(
+                                id = id, name = name.trim(), type = type,
+                                accessKeyId = accessKey, secretAccessKey = secretKey,
+                                sessionToken = sessionToken.ifBlank { null }, region = region,
+                            )
+                            ProfileType.GCP_KEY -> Profile(
+                                id = id, name = name.trim(), type = type,
+                                projectId = projectId, gcpKeyJson = keyJson,
+                            )
+                            ProfileType.GCP_ACCOUNT -> Profile(
+                                id = id, name = name.trim(), type = type,
+                                projectId = projectId, googleEmail = signedInEmail,
+                            )
+                        }
                     )
                 },
                 enabled = canSave,
@@ -144,13 +223,181 @@ fun EditProfileScreen(
                 shape = RoundedCornerShape(12.dp),
             ) {
                 Text(
-                    "Use a dedicated IAM user per account rather than admin keys. It needs " +
-                        "eks:ListClusters and eks:DescribeCluster, plus an EKS access entry on each " +
-                        "cluster with only the Kubernetes permissions you want from your phone.",
+                    when (type) {
+                        ProfileType.AWS ->
+                            "Use a dedicated IAM user per account rather than admin keys. It needs eks:ListClusters " +
+                                "and eks:DescribeCluster, plus an EKS access entry on each cluster."
+                        ProfileType.GCP_KEY ->
+                            "Use a dedicated service account. It needs roles/container.clusterViewer to list " +
+                                "clusters, plus Kubernetes access such as roles/container.developer. Keys don't " +
+                                "expire, so revoke it in IAM if this phone is lost."
+                        ProfileType.GCP_ACCOUNT ->
+                            "Signs in with a Google account on this phone through Google Play services. The " +
+                                "account needs Kubernetes Engine access in the project. Setup steps are in the README."
+                    },
                     style = MaterialTheme.typography.bodySmall,
                     modifier = Modifier.padding(14.dp),
                 )
             }
+        }
+    }
+}
+
+@Composable
+private fun ServiceAccountKeyInput(
+    keyJson: String,
+    keyInfo: Result<Pair<String, String>>?,
+    onKey: (String) -> Unit,
+) {
+    val context = LocalContext.current
+    var readError by remember { mutableStateOf<String?>(null) }
+    var showPaste by remember { mutableStateOf(false) }
+    val picker = rememberLauncherForActivityResult(ActivityResultContracts.OpenDocument()) { uri ->
+        if (uri != null) {
+            val text = runCatching {
+                context.contentResolver.openInputStream(uri)?.use { it.readBytes().toString(Charsets.UTF_8) }
+            }.getOrNull()
+            if (text.isNullOrBlank() || text.length > 64_000) {
+                readError = "Couldn't read that file"
+            } else {
+                readError = null
+                onKey(text.trim())
+            }
+        }
+    }
+
+    Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+        Text("Service account key", style = MaterialTheme.typography.titleSmall)
+        Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+            FilledTonalButton(onClick = { picker.launch(arrayOf("application/json", "application/octet-stream", "text/plain")) }) {
+                Text(if (keyJson.isBlank()) "Choose key file" else "Choose another file")
+            }
+            TextButton(onClick = { showPaste = !showPaste }) { Text(if (showPaste) "Hide paste box" else "Paste instead") }
+        }
+        if (showPaste) {
+            OutlinedTextField(
+                value = keyJson,
+                onValueChange = { onKey(it) },
+                label = { Text("Key JSON") },
+                minLines = 4,
+                maxLines = 8,
+                textStyle = MaterialTheme.typography.bodySmall.copy(fontFamily = Mono),
+                visualTransformation = PasswordVisualTransformation(),
+                keyboardOptions = KeyboardOptions(autoCorrectEnabled = false, keyboardType = KeyboardType.Password),
+                modifier = Modifier.fillMaxWidth(),
+            )
+        }
+        when {
+            readError != null -> Text(readError!!, color = MaterialTheme.colorScheme.error, style = MaterialTheme.typography.bodySmall)
+            keyInfo == null -> Text(
+                "Pick the JSON key you downloaded from IAM > Service accounts > Keys.",
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+            )
+            keyInfo.isSuccess -> Text(
+                "Key for ${keyInfo.getOrNull()?.first}",
+                style = MaterialTheme.typography.bodySmall,
+                fontFamily = Mono,
+                color = StatusColors.ok,
+            )
+            else -> Text(
+                keyInfo.exceptionOrNull()?.message ?: "This key can't be used",
+                color = MaterialTheme.colorScheme.error,
+                style = MaterialTheme.typography.bodySmall,
+            )
+        }
+    }
+}
+
+@Composable
+private fun GoogleSignInInput(
+    requestedEmail: String,
+    onRequestedEmail: (String) -> Unit,
+    signedInEmail: String?,
+    onSignedIn: (String) -> Unit,
+) {
+    val context = LocalContext.current
+    val scope = rememberCoroutineScope()
+    var busy by remember { mutableStateOf(false) }
+    var error by remember { mutableStateOf<String?>(null) }
+    val http = remember { OkHttpClient() }
+
+    fun finish(token: String?) {
+        if (token == null) {
+            busy = false
+            error = "Google didn't return an access token"
+            return
+        }
+        scope.launch {
+            try {
+                val email = withContext(Dispatchers.IO) { GoogleAuth.emailFor(token, http) }
+                onSignedIn(email)
+                error = null
+            } catch (e: Exception) {
+                error = e.message
+            } finally {
+                busy = false
+            }
+        }
+    }
+
+    val launcher = rememberLauncherForActivityResult(ActivityResultContracts.StartIntentSenderForResult()) { res ->
+        val data = res.data
+        if (res.resultCode == Activity.RESULT_OK && data != null) {
+            val result = runCatching { GoogleAuth.client(context).getAuthorizationResultFromIntent(data) }
+            result.onSuccess { finish(it.accessToken) }
+            result.onFailure {
+                busy = false
+                error = "Sign-in failed: ${it.message}"
+            }
+        } else {
+            busy = false
+            error = "Sign-in was cancelled"
+        }
+    }
+
+    Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+        OutlinedTextField(
+            value = requestedEmail,
+            onValueChange = onRequestedEmail,
+            label = { Text("Google account (optional)") },
+            supportingText = { Text("Fill this in if you have several Google accounts on the phone.") },
+            singleLine = true,
+            keyboardOptions = KeyboardOptions(autoCorrectEnabled = false, keyboardType = KeyboardType.Email),
+            modifier = Modifier.fillMaxWidth(),
+        )
+        Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(12.dp)) {
+            FilledTonalButton(
+                enabled = !busy,
+                onClick = {
+                    busy = true
+                    error = null
+                    GoogleAuth.client(context)
+                        .authorize(GoogleAuth.request(requestedEmail.ifBlank { null }))
+                        .addOnSuccessListener { r ->
+                            val pending = r.pendingIntent
+                            if (r.hasResolution() && pending != null) {
+                                launcher.launch(IntentSenderRequest.Builder(pending.intentSender).build())
+                            } else {
+                                finish(r.accessToken)
+                            }
+                        }
+                        .addOnFailureListener { e ->
+                            busy = false
+                            error = "Sign-in failed: ${e.message}. Check the OAuth client setup in the README."
+                        }
+                },
+            ) { Text(if (signedInEmail == null) "Sign in with Google" else "Sign in again") }
+            if (busy) CircularProgressIndicator(Modifier.size(20.dp), strokeWidth = 2.dp)
+        }
+        when {
+            error != null -> Text(error!!, color = MaterialTheme.colorScheme.error, style = MaterialTheme.typography.bodySmall)
+            signedInEmail != null -> Text(
+                "Signed in as $signedInEmail",
+                style = MaterialTheme.typography.bodySmall,
+                fontFamily = Mono,
+                color = StatusColors.ok,
+            )
         }
     }
 }
@@ -196,11 +443,12 @@ fun ProfilesScreen(
             items(session.state.profiles, key = { it.id }) { p ->
                 ResourceRow(
                     title = p.name,
-                    facts = listOfNotNull(
-                        p.maskedKey,
-                        p.region,
-                        if (p.sessionToken != null) "temporary" else null,
-                    ),
+                    facts = if (p.isAws) {
+                        listOfNotNull("AWS", p.maskedKey, p.region, if (p.sessionToken != null) "temporary" else null)
+                    } else {
+                        listOf(if (p.type == ProfileType.GCP_KEY) "GCP key" else "Google", p.projectId)
+                    },
+                    details = detailsOf("Identity" to p.identity),
                     status = if (p.id == activeId) "Active" else null,
                     onClick = { onUse(p) },
                     menu = { close ->
@@ -233,15 +481,12 @@ fun ProfilesScreen(
 @Composable
 fun ClustersScreen(
     session: Session,
-    onOpen: (EksCluster) -> Unit,
+    onOpen: (Cluster) -> Unit,
     onManageProfiles: () -> Unit,
 ) {
     val profile = session.active
     val region = session.region
-    val loader = rememberLoader(profile) {
-        val eks = session.eks()
-        eks.listClusters().map { eks.describeCluster(it) }
-    }
+    val loader = rememberLoader(profile) { session.listClusters() }
 
     AppScaffold(
         title = "Clusters",
@@ -261,19 +506,37 @@ fun ClustersScreen(
             ) {
                 ProfilePicker(session, onManageProfiles)
                 Spacer(Modifier.weight(1f))
-                SelectorButton(region, REGIONS) { session.setRegion(it) }
+                if (profile == null || profile.isAws) {
+                    SelectorButton(region, REGIONS) { session.setRegion(it) }
+                } else {
+                    Text(
+                        profile.projectId,
+                        fontFamily = Mono,
+                        style = MaterialTheme.typography.labelLarge,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        maxLines = 1,
+                        overflow = TextOverflow.Ellipsis,
+                        modifier = Modifier.padding(end = 12.dp).widthIn(max = 180.dp),
+                    )
+                }
             }
             if (loader.loading) LinearProgressIndicator(Modifier.fillMaxWidth())
             loader.error?.let { ErrorCard(it, onRetry = { loader.reload() }) }
             val list = loader.data
             if (list != null && list.isEmpty()) {
-                EmptyState("No EKS clusters for ${profile?.name ?: "this profile"} in $region. Try another region.")
+                EmptyState(
+                    if (profile?.isAws != false) {
+                        "No EKS clusters for ${profile?.name ?: "this profile"} in $region. Try another region."
+                    } else {
+                        "No GKE clusters in project ${profile?.projectId}."
+                    }
+                )
             }
             LazyColumn(
                 contentPadding = PaddingValues(16.dp),
                 verticalArrangement = Arrangement.spacedBy(10.dp),
             ) {
-                items(list.orEmpty(), key = { it.arn.ifBlank { it.name } }) { c ->
+                items(list.orEmpty(), key = { it.id }) { c ->
                     ClusterCard(c) { onOpen(c) }
                 }
             }
@@ -327,7 +590,7 @@ private fun ProfilePicker(session: Session, onManage: () -> Unit) {
 }
 
 @Composable
-private fun ClusterCard(c: EksCluster, onClick: () -> Unit) {
+private fun ClusterCard(c: Cluster, onClick: () -> Unit) {
     val shape = RoundedCornerShape(16.dp)
     Surface(
         shape = shape,
@@ -347,12 +610,17 @@ private fun ClusterCard(c: EksCluster, onClick: () -> Unit) {
             ) {
                 StatusPill(c.status)
                 Text(
-                    "Kubernetes ${c.version}",
+                    "${c.provider} ${c.version}",
+                    style = MaterialTheme.typography.labelLarge,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+                Text(
+                    c.location,
                     style = MaterialTheme.typography.labelLarge,
                     color = MaterialTheme.colorScheme.onSurfaceVariant,
                 )
             }
-            val access = when {
+            val access = c.accessNote ?: when {
                 c.publicAccess && c.privateAccess -> "Public and private endpoint"
                 c.publicAccess -> "Public endpoint"
                 else -> "Private endpoint only. Connect a VPN into the VPC to manage it."

@@ -14,7 +14,8 @@ import androidx.compose.runtime.mutableStateListOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.saveable.rememberSaveableStateHolder
 import androidx.compose.runtime.snapshots.SnapshotStateList
-import dev.ekspocket.aws.EksCluster
+import androidx.compose.ui.platform.LocalContext
+import dev.ekspocket.cloud.Cluster
 import dev.ekspocket.data.CredentialStore
 import dev.ekspocket.k8s.Kind
 import dev.ekspocket.data.Session
@@ -53,7 +54,7 @@ sealed interface Screen {
     /** [id] null means "add a new profile". */
     data class EditProfile(val id: String?) : Screen
     data object Clusters : Screen
-    data class ClusterHome(val cluster: EksCluster) : Screen
+    data class ClusterHome(val cluster: Cluster) : Screen
     data class PodDetail(val ns: String, val name: String) : Screen
     data class Logs(val ns: String, val pod: String, val container: String?) : Screen
     data class Exec(val ns: String, val pod: String, val container: String?) : Screen
@@ -83,7 +84,8 @@ private fun stateKey(index: Int, screen: Screen) = "$index:${screen.hashCode()}"
 
 @Composable
 fun App(store: CredentialStore, viewPrefs: ViewPrefs) {
-    val session = remember { Session(store) }
+    val appContext = LocalContext.current.applicationContext
+    val session = remember { Session(store, appContext) }
     val stack = remember {
         mutableStateListOf<Screen>(
             if (session.state.profiles.isEmpty()) Screen.EditProfile(null) else Screen.Clusters

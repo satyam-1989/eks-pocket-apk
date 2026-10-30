@@ -1,12 +1,15 @@
 # EKS Pocket
 
-An Android 16+ app for managing Amazon EKS clusters from your phone.
+An Android 16+ app for managing Amazon EKS and Google GKE clusters from your phone.
 
 It signs AWS requests itself with your access key, lists your EKS clusters, and talks straight to each cluster's Kubernetes API. Nothing goes through a third-party server.
 
 ## What it does
 
-- Saves several AWS profiles (for example prod, staging, a client account) and switches between them in one tap. The active profile name shows at the top of every screen.
+- Works with EKS (AWS access keys) and GKE (a service account key, or your own Google account).
+- Remembers the last namespace you used on each cluster.
+- Shows each pod's restart count up front (amber from 1, red from 5), when and why it last restarted, and can sort pods by restarts.
+- Saves several profiles (for example prod, staging, a client account) and switches between them in one tap. The active profile name shows at the top of every screen.
 - Lists EKS clusters per region and shows status, version, and endpoint access.
 - Browses, in one namespace or all of them:
   - Workloads: pods, deployments, StatefulSets, ReplicaSets
@@ -127,6 +130,50 @@ Older clusters that only use the `aws-auth` ConfigMap need the IAM user mapped t
 
 **3. Network access:** the phone must be able to reach the cluster's API endpoint. Clusters with a private-only endpoint need a VPN into the VPC. If the public endpoint is restricted by CIDR, your phone's IP must be allowed.
 
+## Set up GKE access
+
+Create a GCP profile in the app. There are two ways to sign in.
+
+### Option A: service account key
+
+1. In the GCP console, go to **IAM & Admin > Service accounts** and create a service account for the phone.
+2. Grant it, on the project:
+   - `roles/container.clusterViewer` to list clusters
+   - Kubernetes access, for example `roles/container.developer` (edit workloads) or `roles/container.admin`. You can use Kubernetes RBAC bindings to the service account's email instead.
+3. Open the service account, go to **Keys > Add key > Create new key > JSON**, and move the file to your phone.
+4. In the app, add a profile, choose **GCP key**, tap **Choose key file**, and check the project ID.
+
+If key creation is blocked, your organization enforces `iam.disableServiceAccountKeyCreation`; use option B instead. Keys don't expire, so delete the key in IAM if the phone is lost.
+
+### Option B: your Google account
+
+This uses the Google account already on the phone. Google requires an OAuth client registered for the app's package name and signing key, once:
+
+1. Get the SHA-1 fingerprint of your signing key (the same `eks-pocket.jks` used for the CI secrets):
+
+   ```
+   keytool -list -v -keystore eks-pocket.jks -alias ekspocket
+   # or with Docker:
+   docker run --rm -it -v "${PWD}:/w" -w /w eclipse-temurin:17-jdk keytool -list -v -keystore eks-pocket.jks -alias ekspocket
+   ```
+
+   Copy the line starting with `SHA1:`.
+
+2. In any GCP project you own, go to **APIs & Services > OAuth consent screen**:
+   - With Google Workspace, choose **Internal**.
+   - Otherwise choose **External**, leave it in **Testing**, and add your Google account under **Test users**.
+3. Go to **APIs & Services > Credentials > Create credentials > OAuth client ID**, choose **Android**, and enter:
+   - Package name: `dev.ekspocket`
+   - SHA-1: the fingerprint from step 1
+4. In each project whose clusters you want to see, make sure the **Kubernetes Engine API** is enabled and your account has a role such as `roles/container.developer`.
+5. In the app, add a profile, choose **Google**, tap **Sign in with Google**, and enter the project ID.
+
+If sign-in fails with a "developer error" (code 10), the SHA-1 or package name doesn't match. The APK must be signed with the key from the CI secrets; a build without them uses a throwaway key with a different SHA-1. With an External consent screen in Testing, Google may ask you to sign in again after 7 days.
+
+### GKE networking
+
+The app connects to the cluster's public endpoint. If the public endpoint is disabled but the DNS-based endpoint allows external traffic, it uses that. Clusters with only a private endpoint need a VPN into the VPC. Authorized networks must include your phone's IP.
+
 ## Security notes
 
 - Keys are encrypted with an AES-256-GCM key held in the Android Keystore. App backup is disabled.
@@ -146,6 +193,7 @@ Older clusters that only use the `aws-auth` ConfigMap need the IAM user mapped t
 ```
 app/src/main/java/dev/ekspocket/
   aws/      SigV4 signing, EKS API, EKS token
+  cloud/    Provider-neutral cluster model, GKE API, Google auth
   k8s/      Kubernetes client, YAML, terminal buffer
   data/     Encrypted profile storage, session
   ui/       Compose screens

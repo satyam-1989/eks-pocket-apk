@@ -33,7 +33,13 @@ fun age(timestamp: String?): String {
     }
 }
 
-data class PodSummary(val phase: String, val ready: String, val restarts: Int)
+data class PodSummary(
+    val phase: String,
+    val ready: String,
+    val restarts: Int,
+    /** e.g. "12m ago, OOMKilled", from the most recently terminated container. */
+    val lastRestart: String? = null,
+)
 
 fun podSummary(p: JSONObject): PodSummary {
     val status = p.optJSONObject("status") ?: JSONObject()
@@ -41,7 +47,15 @@ fun podSummary(p: JSONObject): PodSummary {
     val total = p.optJSONObject("spec")?.optJSONArray("containers")?.length() ?: 0
     var ready = 0
     var restarts = 0
+    var lastAt: Instant? = null
+    var lastReason: String? = null
     for (c in status.optJSONArray("containerStatuses").objects()) {
+        val prev = c.optJSONObject("lastState")?.optJSONObject("terminated")
+        val finished = prev?.optString("finishedAt")?.let { runCatching { Instant.parse(it) }.getOrNull() }
+        if (finished != null && (lastAt == null || finished.isAfter(lastAt))) {
+            lastAt = finished
+            lastReason = prev?.optString("reason")?.ifBlank { null } ?: "exit ${prev?.optInt("exitCode")}"
+        }
         if (c.optBoolean("ready")) ready++
         restarts += c.optInt("restartCount")
         val state = c.optJSONObject("state")
@@ -51,7 +65,8 @@ fun podSummary(p: JSONObject): PodSummary {
         if (!terminated.isNullOrBlank() && phase == "Running") phase = terminated
     }
     if (p.optJSONObject("metadata")?.has("deletionTimestamp") == true) phase = "Terminating"
-    return PodSummary(phase, "$ready/$total", restarts)
+    val last = lastAt?.let { "${age(it.toString())} ago, $lastReason" }
+    return PodSummary(phase, "$ready/$total", restarts, last)
 }
 
 fun containerState(cs: JSONObject?): String {

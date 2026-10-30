@@ -108,11 +108,11 @@ object StatusColors {
 
 private val OK_STATES = setOf(
     "Running", "Active", "ACTIVE", "Ready", "Succeeded", "Completed", "Available", "Bound",
-    "Healthy", "Synced", "True",
+    "Healthy", "Synced", "True", "RUNNING",
 )
 private val WARN_STATES = setOf(
     "Pending", "ContainerCreating", "PodInitializing", "Terminating", "CREATING", "UPDATING",
-    "Progressing", "Cordoned", "Released", "OutOfSync", "Suspended",
+    "Progressing", "Cordoned", "Released", "OutOfSync", "Suspended", "PROVISIONING", "RECONCILING",
 )
 
 fun statusColor(s: String): Color = when {
@@ -431,6 +431,26 @@ fun StatusPill(text: String) {
 
 // ---------- Resource rows in three views ----------
 
+/** "↻ 4": grey at 0, amber from 1, red from 5. */
+@Composable
+fun RestartBadge(restarts: Int) {
+    val c = when {
+        restarts == 0 -> StatusColors.idle
+        restarts < 5 -> StatusColors.warn
+        else -> StatusColors.bad
+    }
+    Text(
+        "↻ $restarts",
+        color = c,
+        style = MaterialTheme.typography.labelSmall,
+        fontWeight = FontWeight.Bold,
+        maxLines = 1,
+        modifier = Modifier
+            .background(c.copy(alpha = 0.15f), RoundedCornerShape(50))
+            .padding(horizontal = 7.dp, vertical = 2.dp),
+    )
+}
+
 val LocalViewMode = compositionLocalOf { ViewMode.DETAILED }
 val LocalViewPrefs = staticCompositionLocalOf<ViewPrefs?> { null }
 
@@ -462,7 +482,11 @@ fun ViewMode.icon(): ImageVector = when (this) {
 }
 
 @Composable
-fun ViewModeButton(mode: ViewMode, onChange: (ViewMode) -> Unit) {
+fun ViewModeButton(
+    mode: ViewMode,
+    onChange: (ViewMode) -> Unit,
+    extraMenu: (@Composable (close: () -> Unit) -> Unit)? = null,
+) {
     var open by remember { mutableStateOf(false) }
     Box {
         IconButton(onClick = { open = true }) {
@@ -482,6 +506,10 @@ fun ViewModeButton(mode: ViewMode, onChange: (ViewMode) -> Unit) {
                     },
                 )
             }
+            if (extraMenu != null) {
+                HorizontalDivider()
+                extraMenu { open = false }
+            }
         }
     }
 }
@@ -495,6 +523,7 @@ fun ListToolbar(
     filterError: String?,
     onText: (String) -> Unit,
     onRegex: (Boolean) -> Unit,
+    extraMenu: (@Composable (close: () -> Unit) -> Unit)? = null,
 ) {
     val prefs = LocalViewPrefs.current
     val mode = prefs?.get(kindKey) ?: ViewMode.DETAILED
@@ -510,7 +539,7 @@ fun ListToolbar(
             onRegex = onRegex,
             modifier = Modifier.weight(1f),
         )
-        ViewModeButton(mode) { prefs?.set(kindKey, it) }
+        ViewModeButton(mode, onChange = { prefs?.set(kindKey, it) }, extraMenu = extraMenu)
     }
 }
 
@@ -542,12 +571,13 @@ fun ResourceRow(
     status: String?,
     onClick: (() -> Unit)? = null,
     details: List<Pair<String, String>> = emptyList(),
+    badge: (@Composable () -> Unit)? = null,
     menu: (@Composable (close: () -> Unit) -> Unit)? = null,
 ) {
     when (LocalViewMode.current) {
-        ViewMode.COMPACT -> CompactRow(title, facts, status, onClick, menu)
-        ViewMode.DETAILED -> DetailedRow(title, facts, status, onClick, details, menu)
-        ViewMode.GRID -> GridCard(title, facts, status, onClick, menu)
+        ViewMode.COMPACT -> CompactRow(title, facts, status, onClick, badge, menu)
+        ViewMode.DETAILED -> DetailedRow(title, facts, status, onClick, details, badge, menu)
+        ViewMode.GRID -> GridCard(title, facts, status, onClick, badge, menu)
     }
 }
 
@@ -564,6 +594,7 @@ private fun CompactRow(
     facts: List<String>,
     status: String?,
     onClick: (() -> Unit)?,
+    badge: (@Composable () -> Unit)?,
     menu: (@Composable (close: () -> Unit) -> Unit)?,
 ) {
     val shape = RoundedCornerShape(8.dp)
@@ -588,6 +619,10 @@ private fun CompactRow(
                 overflow = TextOverflow.Ellipsis,
                 modifier = Modifier.weight(1f),
             )
+            if (badge != null) {
+                Spacer(Modifier.width(8.dp))
+                badge()
+            }
             if (status != null) {
                 Text(
                     status,
@@ -622,6 +657,7 @@ private fun DetailedRow(
     status: String?,
     onClick: (() -> Unit)?,
     details: List<Pair<String, String>>,
+    badge: (@Composable () -> Unit)?,
     menu: (@Composable (close: () -> Unit) -> Unit)?,
 ) {
     val shape = RoundedCornerShape(10.dp)
@@ -646,6 +682,7 @@ private fun DetailedRow(
                     verticalArrangement = Arrangement.spacedBy(4.dp),
                 ) {
                     if (status != null) StatusPill(status)
+                    if (badge != null) badge()
                     facts.forEach {
                         Text(
                             it,
@@ -686,6 +723,7 @@ private fun GridCard(
     facts: List<String>,
     status: String?,
     onClick: (() -> Unit)?,
+    badge: (@Composable () -> Unit)?,
     menu: (@Composable (close: () -> Unit) -> Unit)?,
 ) {
     val shape = RoundedCornerShape(12.dp)
@@ -713,7 +751,12 @@ private fun GridCard(
                 Modifier.padding(start = 12.dp, end = 12.dp, top = 6.dp, bottom = 12.dp),
                 verticalArrangement = Arrangement.spacedBy(4.dp),
             ) {
-                if (status != null) StatusPill(status)
+                if (status != null || badge != null) {
+                    Row(horizontalArrangement = Arrangement.spacedBy(6.dp), verticalAlignment = Alignment.CenterVertically) {
+                        if (status != null) StatusPill(status)
+                        if (badge != null) badge()
+                    }
+                }
                 facts.take(2).forEach {
                     Text(
                         it,
@@ -735,12 +778,14 @@ fun <T> ResourceList(
     key: (T) -> String,
     filter: NameFilter? = null,
     fields: (T) -> List<String?> = { emptyList() },
+    sort: Comparator<T>? = null,
     row: @Composable (T) -> Unit,
 ) {
     val mode = LocalViewMode.current
     val data = loader.data
     val filtering = data != null && filter != null && filter.active
-    val shown = if (filtering && data != null && filter != null) data.filter { filter.matches(fields(it)) } else data
+    val filtered = if (filtering && data != null && filter != null) data.filter { filter.matches(fields(it)) } else data
+    val shown = if (sort != null) filtered?.sortedWith(sort) else filtered
     val countText = if (filtering && data != null && data.isNotEmpty()) "${shown?.size ?: 0} of ${data.size} match" else null
     val emptyMsg = when {
         data != null && data.isEmpty() -> emptyText
